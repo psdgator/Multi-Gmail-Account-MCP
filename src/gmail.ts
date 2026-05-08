@@ -29,7 +29,7 @@ export class GmailClient {
 
     const credentials = JSON.parse(fs.readFileSync(credentialsPath, "utf-8"));
 
-    const oauthKeysPath = this.accountManager.getOAuthKeysPath();
+    const oauthKeysPath = this.accountManager.getOAuthKeysPath(account.alias);
     if (!fs.existsSync(oauthKeysPath)) {
       throw new Error(`OAuth keys not found at ${oauthKeysPath}`);
     }

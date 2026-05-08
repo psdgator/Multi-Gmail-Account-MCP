@@ -130,7 +130,13 @@ export class AccountManager {
     return false;
   }
 
-  getOAuthKeysPath(): string {
+  getOAuthKeysPath(alias?: string): string {
+    if (alias) {
+      const perAccount = path.join(this.getAccountDir(alias), "oauth-keys.json");
+      if (fs.existsSync(perAccount)) {
+        return perAccount;
+      }
+    }
     return path.join(CONFIG_DIR, "oauth-keys.json");
   }
 }
