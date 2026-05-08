@@ -2,7 +2,9 @@ import { Tool, CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
 import { AccountManager } from "../accounts.js";
 import { GmailClient } from "../gmail.js";
 
-export const tools: Tool[] = [
+type AnnotatedTool = Tool & { mutates: boolean };
+
+const ALL_TOOLS: AnnotatedTool[] = [
   {
     name: "list_accounts",
     description: "List all configured Gmail accounts and their authentication status",
@@ -11,6 +13,7 @@ export const tools: Tool[] = [
       properties: {},
       required: [],
     },
+    mutates: false,
   },
   {
     name: "authenticate",
@@ -29,6 +32,7 @@ export const tools: Tool[] = [
       },
       required: ["alias"],
     },
+    mutates: false,
   },
   {
     name: "search_emails",
@@ -51,6 +55,7 @@ export const tools: Tool[] = [
       },
       required: ["account", "query"],
     },
+    mutates: false,
   },
   {
     name: "read_email",
@@ -69,6 +74,7 @@ export const tools: Tool[] = [
       },
       required: ["account", "messageId"],
     },
+    mutates: false,
   },
   {
     name: "send_email",
@@ -106,6 +112,7 @@ export const tools: Tool[] = [
       },
       required: ["account", "to", "subject", "body"],
     },
+    mutates: true,
   },
   {
     name: "list_labels",
@@ -120,6 +127,7 @@ export const tools: Tool[] = [
       },
       required: ["account"],
     },
+    mutates: false,
   },
   {
     name: "modify_email",
@@ -148,15 +156,40 @@ export const tools: Tool[] = [
       },
       required: ["account", "messageId"],
     },
+    mutates: true,
   },
 ];
+
+export function getTools(readOnly: boolean): Tool[] {
+  return ALL_TOOLS
+    .filter((t) => !readOnly || !t.mutates)
+    .map(({ mutates: _mutates, ...t }) => t);
+}
 
 export async function handleToolCall(
   request: CallToolRequest,
   accountManager: AccountManager,
-  gmailClient: GmailClient
+  gmailClient: GmailClient,
+  readOnly: boolean
 ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
   const { name, arguments: args } = request.params;
+
+  const tool = ALL_TOOLS.find((t) => t.name === name);
+  if (!tool) {
+    return {
+      content: [{ type: "text", text: `Unknown tool: ${name}` }],
+    };
+  }
+  if (readOnly && tool.mutates) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Tool "${name}" is disabled in --readonly mode.`,
+        },
+      ],
+    };
+  }
 
   try {
     switch (name) {

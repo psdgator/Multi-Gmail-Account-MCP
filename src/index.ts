@@ -9,7 +9,12 @@ import {
 
 import { AccountManager } from "./accounts.js";
 import { GmailClient } from "./gmail.js";
-import { tools, handleToolCall } from "./tools/index.js";
+import { getTools, handleToolCall } from "./tools/index.js";
+
+const readOnly =
+  process.argv.includes("--readonly") ||
+  process.argv.includes("-r") ||
+  process.env.GMAIL_MCP_READONLY === "1";
 
 const server = new Server(
   {
@@ -27,17 +32,19 @@ const accountManager = new AccountManager();
 const gmailClient = new GmailClient(accountManager);
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools,
+  tools: getTools(readOnly),
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  return handleToolCall(request, accountManager, gmailClient);
+  return handleToolCall(request, accountManager, gmailClient, readOnly);
 });
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Gmail MCP Multi server running on stdio");
+  console.error(
+    `Gmail MCP Multi server running on stdio${readOnly ? " (readonly)" : ""}`
+  );
 }
 
 main().catch(console.error);
