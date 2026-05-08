@@ -173,12 +173,17 @@ export async function handleToolCall(
       }
 
       case "authenticate": {
-        // TODO: Implement OAuth flow
+        const { alias, email } = args as { alias: string; email?: string };
+        const cmd = `node dist/auth.js ${alias}${email ? ` ${email}` : " <email>"}`;
         return {
           content: [
             {
               type: "text",
-              text: "Authentication flow not yet implemented. See issue #3.",
+              text:
+                "Authentication runs as a separate script outside the MCP server " +
+                "(it needs to open a browser and listen on a localhost port). " +
+                `Run from the gmail-mcp-multi checkout:\n\n  ${cmd}\n\n` +
+                "Then call list_accounts to confirm.",
             },
           ],
         };

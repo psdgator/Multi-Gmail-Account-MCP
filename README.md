@@ -67,11 +67,27 @@ minimal `PATH`, so a bare `node` may not resolve — use the output of `which no
 
 ### 4. Authenticate accounts
 
-Once the MCP is running, use the `authenticate` tool:
+Authentication runs as a one-off Node script (it needs to open a browser and
+listen on a localhost port, which doesn't fit inside an MCP request). After
+`npm run build`, from the project checkout:
+
+```bash
+node dist/auth.js personal you@gmail.com
+node dist/auth.js work you@company.com
 ```
-authenticate({ alias: "work", email: "you@company.com" })
-authenticate({ alias: "personal", email: "you@gmail.com" })
-```
+
+Each invocation prints a Google authorization URL, listens on
+`http://127.0.0.1:<random-port>` for the redirect, exchanges the code for
+tokens, and writes them to `~/.gmail-mcp/accounts/<alias>/credentials.json`.
+
+The script requests the `gmail.readonly` scope, so the resulting tokens
+can never mutate the mailbox even if the MCP server is later started
+without `--readonly`.
+
+For multi-org setups (accounts in different Google Workspace
+organizations), drop a per-account `oauth-keys.json` into
+`~/.gmail-mcp/accounts/<alias>/` before running the script — see
+"Configuration" below.
 
 ### 5. Use it!
 
