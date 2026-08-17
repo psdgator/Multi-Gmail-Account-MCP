@@ -1,6 +1,6 @@
 import { google, gmail_v1 } from "googleapis";
 import * as fs from "fs";
-import { AccountManager } from "./accounts.js";
+import { AccountManager, writeSecureFile } from "./accounts.js";
 
 export class GmailClient {
   private clients: Map<string, gmail_v1.Gmail> = new Map();
@@ -50,7 +50,7 @@ export class GmailClient {
       }
       credentials.access_token = tokens.access_token;
       credentials.expiry_date = tokens.expiry_date;
-      fs.writeFileSync(credentialsPath, JSON.stringify(credentials, null, 2));
+      writeSecureFile(credentialsPath, JSON.stringify(credentials, null, 2));
     });
 
     const client = google.gmail({ version: "v1", auth: oauth2Client });

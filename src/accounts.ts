@@ -21,6 +21,34 @@ const CONFIG_DIR = path.join(os.homedir(), ".gmail-mcp");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const ACCOUNTS_DIR = path.join(CONFIG_DIR, "accounts");
 
+/** Owner-only permissions for anything holding OAuth material. */
+const DIR_MODE = 0o700;
+const FILE_MODE = 0o600;
+
+/**
+ * Write a file that only the owner can read.
+ *
+ * The `mode` option is applied by the OS only when the file is created, so an
+ * explicit chmod follows to also tighten files written by earlier versions.
+ */
+export function writeSecureFile(filePath: string, data: string): void {
+  fs.writeFileSync(filePath, data, { mode: FILE_MODE });
+  fs.chmodSync(filePath, FILE_MODE);
+}
+
+/**
+ * Create a directory only the owner can enter.
+ *
+ * `mode` is honoured only on creation, so directories left behind by earlier
+ * versions (created world-readable) are tightened on every startup.
+ */
+function ensureSecureDir(dirPath: string): void {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true, mode: DIR_MODE });
+  }
+  fs.chmodSync(dirPath, DIR_MODE);
+}
+
 export class AccountManager {
   private config: Config = { accounts: [] };
 
@@ -30,12 +58,8 @@ export class AccountManager {
   }
 
   private ensureDirectories(): void {
-    if (!fs.existsSync(CONFIG_DIR)) {
-      fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    }
-    if (!fs.existsSync(ACCOUNTS_DIR)) {
-      fs.mkdirSync(ACCOUNTS_DIR, { recursive: true });
-    }
+    ensureSecureDir(CONFIG_DIR);
+    ensureSecureDir(ACCOUNTS_DIR);
   }
 
   private loadConfig(): void {
@@ -46,7 +70,7 @@ export class AccountManager {
   }
 
   private saveConfig(): void {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(this.config, null, 2));
+    writeSecureFile(CONFIG_FILE, JSON.stringify(this.config, null, 2));
   }
 
   getAccountDir(alias: string): string {
@@ -85,10 +109,7 @@ export class AccountManager {
     }
 
     // Create account directory
-    const accountDir = this.getAccountDir(alias);
-    if (!fs.existsSync(accountDir)) {
-      fs.mkdirSync(accountDir, { recursive: true });
-    }
+    ensureSecureDir(this.getAccountDir(alias));
 
     this.saveConfig();
   }
