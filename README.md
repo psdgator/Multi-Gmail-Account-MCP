@@ -14,14 +14,17 @@ Unlike other Gmail MCPs that require running separate server instances per accou
 
 ## Installation
 
+This package is not published to npm yet, so install it from source:
+
 ```bash
-npm install -g gmail-mcp-multi
+git clone https://github.com/dmorrill/gmail-mcp-multi.git
+cd gmail-mcp-multi
+npm install
+npm run build
 ```
 
-Or run directly with npx:
-```bash
-npx gmail-mcp-multi
-```
+That produces `dist/index.js`, which is the server entry point your MCP client
+runs. Note the absolute path to it — you'll need it below.
 
 ## Quick Start
 
@@ -41,17 +44,26 @@ Create `~/.gmail-mcp/oauth-keys.json` with your OAuth credentials.
 
 ### 3. Add to your MCP client
 
-**Claude Code (`~/.claude/settings.json`):**
+**Claude Code:**
+```bash
+claude mcp add gmail -- node /absolute/path/to/gmail-mcp-multi/dist/index.js
+```
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`
+on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
 ```json
 {
   "mcpServers": {
     "gmail": {
-      "command": "npx",
-      "args": ["gmail-mcp-multi"]
+      "command": "/usr/local/bin/node",
+      "args": ["/absolute/path/to/gmail-mcp-multi/dist/index.js"]
     }
   }
 }
 ```
+
+Both paths must be absolute. Claude Desktop in particular launches servers with a
+minimal `PATH`, so a bare `node` may not resolve — use the output of `which node`.
 
 ### 4. Authenticate accounts
 
@@ -111,6 +123,11 @@ Credentials are stored in `~/.gmail-mcp/`:
     └── personal/
         └── credentials.json
 ```
+
+These files hold OAuth refresh tokens that grant ongoing access to your mailboxes.
+The server creates its directories as `0700` and its credential files as `0600`, and
+re-applies those permissions on startup to tighten anything left behind by an earlier
+version. Never commit them or place them on a shared filesystem.
 
 ## Development
 
