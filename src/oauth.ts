@@ -11,6 +11,8 @@ export const SCOPE = {
   readonly: "https://www.googleapis.com/auth/gmail.readonly",
   modify: "https://www.googleapis.com/auth/gmail.modify",
   settings: "https://www.googleapis.com/auth/gmail.settings.basic",
+  calendarRead: "https://www.googleapis.com/auth/calendar.readonly",
+  calendarEvents: "https://www.googleapis.com/auth/calendar.events",
 } as const;
 
 /**
@@ -20,15 +22,10 @@ export const SCOPE = {
  * "drafts" mode the guarantee that nothing is sent comes from this server not
  * exposing any send tool.
  */
-export function scopesForMode(mode: Mode): string[] {
-  switch (mode) {
-    case "readonly":
-      return [SCOPE.readonly];
-    case "drafts":
-      return [SCOPE.modify];
-    case "full":
-      return [SCOPE.modify, SCOPE.settings];
-  }
+export function scopesForMode(mode: Mode, opts: { calendar?: boolean } = {}): string[] {
+  const mail = mode === "readonly" ? [SCOPE.readonly] : mode === "drafts" ? [SCOPE.modify] : [SCOPE.modify, SCOPE.settings];
+  if (!opts.calendar) return mail;
+  return [...mail, SCOPE.calendarRead, ...(mode === "full" ? [SCOPE.calendarEvents] : [])];
 }
 
 export interface OAuthClientKeys {
@@ -72,11 +69,22 @@ export function openBrowser(url: string): void {
   }
 }
 
+export interface AuthResult {
+  alias: string;
+  email: string;
+  scopes: string[];
+}
+
 export interface AuthFlow {
   /** URL the user must open to sign in. */
   url: string;
   /** Resolves once the account is saved (or rejects on error / timeout). */
-  done: Promise<{ alias: string; email: string; scopes: string[] }>;
+  done: Promise<AuthResult>;
+  /**
+   * Finish the flow from the URL Google redirected to (for headless servers:
+   * the browser shows "can't connect to 127.0.0.1"; paste that address here).
+   */
+  completeFromRedirect: (redirectedUrl: string) => Promise<AuthResult>;
   cancel: () => void;
 }
 
@@ -91,18 +99,23 @@ function page(title: string, body: string, ok: boolean): string {
 <p style="color:#333;line-height:1.5">${body}</p></div></body></html>`;
 }
 
+export class WrongAccountError extends Error {}
+
 /**
  * Start the OAuth "loopback" flow for one account: listens on 127.0.0.1 on a
  * random port, waits for Google's redirect, exchanges the code (with PKCE),
- * checks which mailbox actually signed in, and saves the tokens.
+ * checks which mailbox actually signed in, and saves the tokens (encrypted).
+ *
+ * If `emailHint` is given and a different Google account signs in, the tokens
+ * are discarded unless `allowDifferentEmail` is set.
  */
 export async function startAuthFlow(
   accounts: AccountManager,
-  opts: { alias: string; emailHint?: string; mode: Mode; timeoutMs?: number }
+  opts: { alias: string; emailHint?: string; mode: Mode; calendar?: boolean; allowDifferentEmail?: boolean; timeoutMs?: number }
 ): Promise<AuthFlow> {
   const { alias, emailHint, mode } = opts;
   const keys = loadClientKeys(accounts.getOAuthKeysPath(alias));
-  const scopes = scopesForMode(mode);
+  const scopes = scopesForMode(mode, { calendar: opts.calendar });
   const state = crypto.randomBytes(16).toString("hex");
 
   const server = http.createServer();
@@ -127,75 +140,97 @@ export async function startAuthFlow(
   });
 
   let timer: NodeJS.Timeout | undefined;
+  let settled = false;
+  let resolveDone!: (r: AuthResult) => void;
+  let rejectDone!: (e: Error) => void;
+  const done = new Promise<AuthResult>((res, rej) => {
+    resolveDone = res;
+    rejectDone = rej;
+  });
   const close = () => {
     if (timer) clearTimeout(timer);
     server.close();
   };
+  const settle = (err: Error | undefined, result?: AuthResult) => {
+    if (settled) return;
+    settled = true;
+    close();
+    if (err) rejectDone(err);
+    else resolveDone(result!);
+  };
 
-  const done = new Promise<{ alias: string; email: string; scopes: string[] }>((resolve, reject) => {
-    timer = setTimeout(() => {
-      close();
-      reject(new Error(`Sign-in for "${alias}" timed out. Run authenticate again.`));
-    }, opts.timeoutMs ?? 10 * 60 * 1000);
+  timer = setTimeout(() => settle(new Error(`Sign-in for "${alias}" timed out. Run authenticate again.`)), opts.timeoutMs ?? 10 * 60 * 1000);
 
-    server.on("request", async (req, res) => {
-      const reqUrl = new URL(req.url || "/", redirectUri);
-      if (reqUrl.pathname !== "/") {
-        res.writeHead(404).end();
-        return;
-      }
-      const send = (status: number, html: string) => {
-        res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(html);
+  /** Exchange the code, verify the mailbox, save. */
+  const finish = async (code: string): Promise<AuthResult> => {
+    const { tokens } = await client.getToken({ code, codeVerifier });
+    client.setCredentials(tokens);
+    const rootUrl = process.env.GMAIL_MCP_API_ROOT || undefined;
+    const g = gmail({ version: "v1", auth: client, ...(rootUrl ? { rootUrl } : {}) });
+    const profile = await g.users.getProfile({ userId: "me" });
+    const email = profile.data.emailAddress;
+    if (!email) throw new Error("Google did not return the mailbox address.");
+    if (emailHint && emailHint.toLowerCase() !== email.toLowerCase() && !opts.allowDifferentEmail) {
+      await client.revokeToken(tokens.access_token ?? "").catch(() => undefined);
+      throw new WrongAccountError(
+        `You signed in as ${email}, but "${alias}" is meant for ${emailHint}. Nothing was saved; sign in again and pick ${emailHint}.`
+      );
+    }
+    const granted = (tokens.scope || "").split(/\s+/).filter(Boolean);
+    const hasCalendar = granted.some((s) => s.includes("/auth/calendar"));
+    accounts.addAccount(alias, email, undefined, { type: "gmail", ...(hasCalendar ? { calendar: true } : {}) });
+    accounts.saveCredentials(alias, tokens);
+    return { alias, email, scopes: granted };
+  };
+
+  const handle = async (reqUrl: URL): Promise<{ status: number; html: string; result?: AuthResult; error?: Error; final: boolean }> => {
+    const error = reqUrl.searchParams.get("error");
+    if (error) {
+      return { status: 400, html: page("Sign-in cancelled", `Google returned: ${escapeHtml(error)}. You can close this tab.`, false), error: new Error(`Google sign-in failed: ${error}`), final: true };
+    }
+    const code = reqUrl.searchParams.get("code");
+    if (!code || reqUrl.searchParams.get("state") !== state) {
+      return { status: 400, html: page("Invalid response", "Missing code or state mismatch. Start the sign-in again.", false), final: false };
+    }
+    try {
+      const result = await finish(code);
+      return {
+        status: 200,
+        html: page("Gmail account connected", `<b>${escapeHtml(result.email)}</b> is now available to Claude as <b>${escapeHtml(alias)}</b>.<br><br>You can close this tab.`, true),
+        result,
+        final: true,
       };
-      try {
-        const error = reqUrl.searchParams.get("error");
-        if (error) {
-          send(400, page("Sign-in cancelled", `Google returned: ${escapeHtml(error)}. You can close this tab.`, false));
-          close();
-          reject(new Error(`Google sign-in failed: ${error}`));
-          return;
-        }
-        const code = reqUrl.searchParams.get("code");
-        if (!code || reqUrl.searchParams.get("state") !== state) {
-          send(400, page("Invalid response", "Missing code or state mismatch. Start the sign-in again.", false));
-          return;
-        }
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      return { status: e instanceof WrongAccountError ? 409 : 500, html: page(e instanceof WrongAccountError ? "Wrong Google account" : "Something went wrong", escapeHtml(err.message), false), error: err, final: true };
+    }
+  };
 
-        const { tokens } = await client.getToken({ code, codeVerifier });
-        client.setCredentials(tokens);
-        const rootUrl = process.env.GMAIL_MCP_API_ROOT || undefined;
-        const g = gmail({ version: "v1", auth: client, ...(rootUrl ? { rootUrl } : {}) });
-        const profile = await g.users.getProfile({ userId: "me" });
-        const email = profile.data.emailAddress;
-        if (!email) throw new Error("Google did not return the mailbox address.");
-
-        const granted = (tokens.scope || "").split(/\s+/).filter(Boolean);
-        accounts.addAccount(alias, email, undefined);
-        accounts.saveCredentials(alias, tokens);
-
-        const mismatch =
-          emailHint && emailHint.toLowerCase() !== email.toLowerCase()
-            ? `<br><br><b>Note:</b> you signed in as ${escapeHtml(email)}, not ${escapeHtml(emailHint)}.`
-            : "";
-        send(
-          200,
-          page(
-            "Gmail account connected",
-            `<b>${escapeHtml(email)}</b> is now available to Claude as <b>${escapeHtml(alias)}</b>.${mismatch}<br><br>You can close this tab.`,
-            true
-          )
-        );
-        close();
-        resolve({ alias, email, scopes: granted });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        send(500, page("Something went wrong", escapeHtml(msg), false));
-        close();
-        reject(e instanceof Error ? e : new Error(msg));
-      }
-    });
+  server.on("request", async (req, res) => {
+    const reqUrl = new URL(req.url || "/", redirectUri);
+    if (reqUrl.pathname !== "/") {
+      res.writeHead(404).end();
+      return;
+    }
+    const out = await handle(reqUrl);
+    res.writeHead(out.status, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(out.html);
+    if (out.final) settle(out.error, out.result);
   });
 
-  return { url, done, cancel: close };
+  const completeFromRedirect = async (redirectedUrl: string): Promise<AuthResult> => {
+    let u: URL;
+    try {
+      u = new URL(redirectedUrl.trim());
+    } catch {
+      throw new Error("That doesn't look like a URL. Paste the full address from the browser's address bar.");
+    }
+    const out = await handle(u);
+    if (!out.final) throw new Error("The pasted address has no valid code/state. Use the address from this sign-in attempt.");
+    settle(out.error, out.result);
+    if (out.error) throw out.error;
+    return out.result!;
+  };
+
+  return { url, done, completeFromRedirect, cancel: () => settle(new Error("cancelled")) };
 }

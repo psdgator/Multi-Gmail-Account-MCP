@@ -1,19 +1,20 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import type { gmail_v1 } from "@googleapis/gmail";
 import type { AccountConfig, AccountManager } from "../accounts.js";
+import { AuditLog, READ_ONLY_TOOLS, redact } from "../audit.js";
 import { minMode, Mode, modeAllows } from "../config.js";
-import type { GmailClient } from "../gmail.js";
-import type { LabelNames } from "../message.js";
 import type { AuthFlow } from "../oauth.js";
+import type { MailRegistry } from "../providers/registry.js";
 
 export interface ToolContext {
   accounts: AccountManager;
-  gmail: GmailClient;
+  mail: MailRegistry;
   /** The server-wide ceiling chosen at startup (--mode). */
   mode: Mode;
-  labels: LabelCache;
+  audit: AuditLog;
+  /** "stdio" (local) or "http" (hosted); some tools behave differently when hosted. */
+  transport: "stdio" | "http";
   pendingAuth: Map<string, { flow: AuthFlow; startedAt: number; result?: string }>;
 }
 
@@ -40,7 +41,7 @@ export function requireMode(ctx: ToolContext, acc: AccountConfig, need: Mode, to
 function accountList(ctx: ToolContext): string {
   const list = ctx.accounts.listAccounts();
   if (!list.length) return "No accounts connected yet.";
-  return `Connected: ${list.map((a) => `${a.alias} = ${a.email}${a.isDefault ? " (default)" : ""}`).join("; ")}.`;
+  return `Connected: ${list.map((a) => `${a.alias} = ${a.email}${a.type === "imap" ? " (IMAP)" : ""}${a.isDefault ? " (default)" : ""}`).join("; ")}.`;
 }
 
 /** `account` argument for tools that can read several mailboxes at once. */
@@ -61,19 +62,34 @@ export function singleAccountArg(ctx: ToolContext) {
     .describe(`Account alias or email address. Omit to use the default account. ${accountList(ctx)}`);
 }
 
+/** A tool result that is not JSON (e.g. an image for Claude to look at). */
+export class RawResult {
+  constructor(readonly result: CallToolResult) {}
+}
+
 export interface ToolDef<Shape extends z.ZodRawShape> {
   name: string;
   title: string;
   description: string;
   /** Minimum server mode needed for this tool to be offered at all. */
   minMode: Mode;
+  /** Only offer the tool when this returns true (e.g. not in hosted mode). */
+  when?: (ctx: ToolContext) => boolean;
   annotations?: ToolAnnotations;
   input: Shape;
   run: (args: z.objectOutputType<Shape, z.ZodTypeAny>) => Promise<unknown>;
 }
 
+function accountsIn(args: Record<string, unknown> | undefined): string[] | undefined {
+  const a = args?.account;
+  if (a === undefined) return undefined;
+  return Array.isArray(a) ? a.map(String) : String(a).split(",").map((s) => s.trim());
+}
+
 export function register<Shape extends z.ZodRawShape>(server: McpServer, ctx: ToolContext, def: ToolDef<Shape>): boolean {
   if (!modeAllows(ctx.mode, def.minMode)) return false;
+  if (def.when && !def.when(ctx)) return false;
+  if (def.annotations?.readOnlyHint) READ_ONLY_TOOLS.add(def.name);
   server.registerTool(
     def.name,
     {
@@ -83,10 +99,16 @@ export function register<Shape extends z.ZodRawShape>(server: McpServer, ctx: To
       annotations: { title: def.title, ...def.annotations },
     },
     (async (args: z.objectOutputType<Shape, z.ZodTypeAny>) => {
+      const started = Date.now();
+      const base = { tool: def.name, mode: ctx.mode, via: ctx.transport, accounts: accountsIn(args as Record<string, unknown>), args: redact(args as Record<string, unknown>) };
       try {
-        return ok(await def.run(args));
+        const value = await def.run(args);
+        ctx.audit.record({ ...base, ok: true, ms: Date.now() - started });
+        return value instanceof RawResult ? value.result : ok(value);
       } catch (err) {
-        return fail(err instanceof Error ? err.message : String(err));
+        const message = err instanceof Error ? err.message : String(err);
+        ctx.audit.record({ ...base, ok: false, error: message.slice(0, 300), ms: Date.now() - started });
+        return fail(message);
       }
     }) as never
   );
@@ -97,34 +119,24 @@ export const READ_ONLY: ToolAnnotations = { readOnlyHint: true, destructiveHint:
 export const WRITES: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, openWorldHint: true };
 export const DESTRUCTIVE: ToolAnnotations = { readOnlyHint: false, destructiveHint: true, openWorldHint: true };
 
-/** Per-account label id <-> name cache (labels rarely change). */
-export class LabelCache {
-  private cache = new Map<string, { at: number; byId: LabelNames; byName: Map<string, string> }>();
-  constructor(private ttlMs = 5 * 60 * 1000) {}
-
-  async get(alias: string, g: gmail_v1.Gmail): Promise<{ byId: LabelNames; byName: Map<string, string> }> {
-    const hit = this.cache.get(alias);
-    if (hit && Date.now() - hit.at < this.ttlMs) return hit;
-    const res = await g.users.labels.list({ userId: "me" });
-    const byId: LabelNames = new Map();
-    const byName = new Map<string, string>();
-    for (const l of res.data.labels ?? []) {
-      if (!l.id || !l.name) continue;
-      if (l.type !== "system") byId.set(l.id, l.name);
-      byName.set(l.name.toLowerCase(), l.id);
-      byName.set(l.id.toLowerCase(), l.id);
+/** Sort newest first and merge copies of the same email found in several accounts. */
+export function mergeAndDedupe<T extends { date: string; account: string; rfcMessageId?: string; alsoIn?: string[] }>(items: T[]): T[] {
+  const sorted = [...items].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  const seen = new Map<string, T>();
+  const out: T[] = [];
+  for (const m of sorted) {
+    const key = m.rfcMessageId?.trim().toLowerCase();
+    if (key) {
+      const first = seen.get(key);
+      if (first) {
+        if (first.account !== m.account) {
+          first.alsoIn = [...new Set([...(first.alsoIn ?? []), m.account])];
+        }
+        continue;
+      }
+      seen.set(key, m);
     }
-    const entry = { at: Date.now(), byId, byName };
-    this.cache.set(alias, entry);
-    return entry;
+    out.push(m);
   }
-
-  invalidate(alias: string): void {
-    this.cache.delete(alias);
-  }
-}
-
-/** Gmail's web URL for a mailbox (selects the right account by email). */
-export function gmailUrl(email: string, fragment: string): string {
-  return `https://mail.google.com/mail/u/${encodeURIComponent(email)}/#${fragment}`;
+  return out;
 }

@@ -115,9 +115,19 @@ function matches(m: Msg, q: string): boolean {
   });
 }
 
-export async function startFakeGmail(): Promise<{ url: string; boxes: Record<string, Mailbox>; requests: string[]; close: () => Promise<void> }> {
+export interface FakeGmail {
+  url: string;
+  boxes: Record<string, Mailbox>;
+  requests: string[];
+  /** "METHOD /path" -> number of upcoming requests to fail with 503. */
+  faults: Map<string, number>;
+  close: () => Promise<void>;
+}
+
+export async function startFakeGmail(): Promise<FakeGmail> {
   const boxes = fixtures();
   const requests: string[] = [];
+  const faults = new Map<string, number>();
   let seq = 1;
 
   const server = http.createServer(async (req, res) => {
@@ -126,6 +136,14 @@ export async function startFakeGmail(): Promise<{ url: string; boxes: Record<str
     const bodyText = Buffer.concat(chunks).toString("utf8");
     const url = new URL(req.url ?? "/", "http://x");
     requests.push(`${req.method} ${url.pathname}`);
+    const faultKey = `${req.method} ${url.pathname.replace(/^\/gmail\/v1\/users\/me/, "")}`;
+    const pending = faults.get(faultKey) ?? 0;
+    if (pending > 0) {
+      faults.set(faultKey, pending - 1);
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { code: 503, message: "Backend Error" } }));
+      return;
+    }
     const send = (status: number, obj: unknown) => {
       res.writeHead(status, { "Content-Type": "application/json" });
       res.end(JSON.stringify(obj));
@@ -194,5 +212,5 @@ export async function startFakeGmail(): Promise<{ url: string; boxes: Record<str
 
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const port = (server.address() as AddressInfo).port;
-  return { url: `http://127.0.0.1:${port}/`, boxes, requests, close: () => new Promise((r) => server.close(() => r())) };
+  return { url: `http://127.0.0.1:${port}/`, boxes, requests, faults, close: () => new Promise((r) => server.close(() => r())) };
 }

@@ -1,7 +1,10 @@
 import { convert } from "html-to-text";
 import type { gmail_v1 } from "@googleapis/gmail";
 
-/** Turns Gmail API message payloads into compact, readable objects. */
+/**
+ * The provider-neutral message shape returned by every tool, plus helpers that
+ * turn Gmail API payloads into it. (The IMAP provider builds the same shape.)
+ */
 
 type Part = gmail_v1.Schema$MessagePart;
 
@@ -31,9 +34,13 @@ export interface CleanMessage {
   bodyFormat?: "text" | "html-converted";
   bodyTruncated?: boolean;
   attachments?: AttachmentInfo[];
-  /** RFC Message-ID header, used for reply threading. */
-  messageId?: string;
+  /** RFC Message-ID header (threading, and de-duplicating across accounts). */
+  rfcMessageId?: string;
   references?: string;
+  /** Extra headers requested by the tool (lower-case names). */
+  headers?: Record<string, string>;
+  /** Same message also found in these accounts (cross-account de-duplication). */
+  alsoIn?: string[];
 }
 
 export function header(headers: gmail_v1.Schema$MessagePartHeader[] | undefined, name: string): string | undefined {
@@ -141,7 +148,7 @@ export function labelName(id: string, names?: LabelNames): string {
 export function toClean(
   account: string,
   msg: gmail_v1.Schema$Message,
-  opts: { body?: boolean; maxBodyChars?: number; labelNames?: LabelNames } = {}
+  opts: { body?: boolean; maxBodyChars?: number; labelNames?: LabelNames; headers?: string[] } = {}
 ): CleanMessage {
   const h = msg.payload?.headers ?? undefined;
   const labelIds = msg.labelIds ?? [];
@@ -162,6 +169,16 @@ export function toClean(
   if (cc) out.cc = cc;
   const replyTo = header(h, "Reply-To");
   if (replyTo) out.replyTo = replyTo;
+  const rfcId = header(h, "Message-ID") ?? header(h, "Message-Id");
+  if (rfcId) out.rfcMessageId = rfcId;
+  if (opts.headers?.length) {
+    const extra: Record<string, string> = {};
+    for (const name of opts.headers) {
+      const v = header(h, name);
+      if (v !== undefined) extra[name.toLowerCase()] = v;
+    }
+    if (Object.keys(extra).length) out.headers = extra;
+  }
 
   if (opts.body) {
     const { text, format } = extractBody(msg.payload ?? undefined);
@@ -171,7 +188,6 @@ export function toClean(
     if (text.length > max) out.bodyTruncated = true;
     const atts = listAttachments(msg.payload ?? undefined);
     if (atts.length) out.attachments = atts;
-    out.messageId = header(h, "Message-ID") ?? header(h, "Message-Id");
     const refs = header(h, "References");
     if (refs) out.references = refs;
   } else if (msg.snippet) {

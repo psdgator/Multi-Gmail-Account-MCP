@@ -1,12 +1,44 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { configDir, ensureSecureDir, isMode, Mode, writeSecureFile } from "./config.js";
+import { SecretStore } from "./secrets.js";
+
+export type AccountType = "gmail" | "imap";
+
+export interface ImapServerConfig {
+  host: string;
+  port: number;
+  /** true = implicit TLS (993/465); false = STARTTLS (143/587). */
+  secure: boolean;
+  /** Login name; defaults to the account email. */
+  user?: string;
+  /** Allow self-signed certificates (only for your own test servers). */
+  allowInsecureTls?: boolean;
+}
 
 export interface AccountConfig {
   alias: string;
   email: string;
+  /** "gmail" (default, Gmail API + OAuth) or "imap" (any IMAP/SMTP mailbox). */
+  type?: AccountType;
   /** Optional per-account cap on what tools may do (never raises the server mode). */
   mode?: Mode;
+  /** IMAP accounts: incoming server. */
+  imap?: ImapServerConfig;
+  /** IMAP accounts: outgoing server (only needed for sending in full mode). */
+  smtp?: ImapServerConfig;
+  /** IMAP accounts: display name for the From header. */
+  displayName?: string;
+  /** IMAP accounts: plain-text signature appended to drafts. */
+  signature?: string;
+  /** Other addresses that belong to you in this mailbox (for reply-all / needs-reply). */
+  extraAddresses?: string[];
+  /** Gmail accounts: Google Calendar access was granted. */
+  calendar?: boolean;
+}
+
+export function accountType(acc: AccountConfig): AccountType {
+  return acc.type ?? "gmail";
 }
 
 export interface Account extends AccountConfig {
@@ -37,6 +69,7 @@ const ALL_WORDS = new Set(["all", "*", "every", "everything", "all accounts"]);
 
 export class AccountManager {
   readonly root: string;
+  readonly secrets: SecretStore;
   private readonly configFile: string;
   private readonly accountsDir: string;
   private config: Config = { accounts: [] };
@@ -46,6 +79,7 @@ export class AccountManager {
     this.root = root;
     this.configFile = path.join(root, "config.json");
     this.accountsDir = path.join(root, "accounts");
+    this.secrets = new SecretStore(root);
     ensureSecureDir(this.root);
     ensureSecureDir(this.accountsDir);
     this.reload();
@@ -152,7 +186,7 @@ export class AccountManager {
     return acc;
   }
 
-  addAccount(alias: string, email: string, mode?: Mode): AccountConfig {
+  addAccount(alias: string, email: string, mode?: Mode, extra: Partial<AccountConfig> = {}): AccountConfig {
     this.reload();
     const a = validateAlias(alias);
     const clash = this.config.accounts.find(
@@ -163,14 +197,26 @@ export class AccountManager {
     }
     const existing = this.config.accounts.find((acc) => acc.alias === a);
     if (existing) {
+      if (accountType(existing) !== (extra.type ?? accountType(existing))) {
+        throw new Error(`"${a}" is already a ${accountType(existing)} account. Remove it first or pick another alias.`);
+      }
       existing.email = email;
       if (mode) existing.mode = mode;
+      Object.assign(existing, extra);
     } else {
-      this.config.accounts.push({ alias: a, email, ...(mode ? { mode } : {}) });
+      this.config.accounts.push({ alias: a, email, ...(mode ? { mode } : {}), ...extra });
     }
     ensureSecureDir(this.getAccountDir(a));
     this.save();
     return this.requireAccount(a);
+  }
+
+  /** Merge fields into an existing account's config. */
+  updateAccount(aliasOrEmail: string, patch: Partial<AccountConfig>): AccountConfig {
+    const acc = this.requireAccount(aliasOrEmail);
+    Object.assign(acc, patch);
+    this.save();
+    return acc;
   }
 
   removeAccount(aliasOrEmail: string): boolean {
@@ -184,9 +230,29 @@ export class AccountManager {
     return true;
   }
 
-  saveCredentials(alias: string, tokens: object): void {
+  /** Store OAuth tokens (Gmail) or the password (IMAP), encrypted at rest. */
+  saveCredentials(alias: string, secret: object): void {
     ensureSecureDir(this.getAccountDir(alias));
-    writeSecureFile(this.getCredentialsPath(alias), JSON.stringify(tokens, null, 2));
+    this.secrets.write(this.getCredentialsPath(alias), secret);
+  }
+
+  loadCredentials<T = Record<string, unknown>>(alias: string): T {
+    const file = this.getCredentialsPath(alias);
+    if (!fs.existsSync(file)) throw new Error(`"${alias}" is not signed in yet.`);
+    return this.secrets.read<T>(file);
+  }
+
+  /** Encrypt any credential files left in plain text by older versions. */
+  migrateCredentials(): string[] {
+    const migrated: string[] = [];
+    for (const acc of this.config.accounts) {
+      try {
+        if (this.secrets.migrate(this.getCredentialsPath(acc.alias))) migrated.push(acc.alias);
+      } catch (err) {
+        console.error(`[gmail-mcp-multi] could not encrypt credentials of ${acc.alias}:`, (err as Error).message);
+      }
+    }
+    return migrated;
   }
 
   /**

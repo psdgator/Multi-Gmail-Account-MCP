@@ -11,6 +11,7 @@ import { startFakeGmail } from "./fake-gmail.js";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRY = path.join(ROOT, "dist", "index.js");
 
+const TEST_KEY = "a".repeat(64);
 let fake: Awaited<ReturnType<typeof startFakeGmail>>;
 let home: string;
 
@@ -42,7 +43,7 @@ async function connect(mode: string): Promise<Client> {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [ENTRY, "--mode", mode],
-    env: { ...process.env, GMAIL_MCP_HOME: home, GMAIL_MCP_API_ROOT: fake.url, GMAIL_MCP_NO_BROWSER: "1" } as Record<string, string>,
+    env: { ...process.env, GMAIL_MCP_HOME: home, GMAIL_MCP_API_ROOT: fake.url, GMAIL_MCP_NO_BROWSER: "1", GMAIL_MCP_MASTER_KEY: TEST_KEY } as Record<string, string>,
     stderr: "pipe",
   });
   const client = new Client({ name: "e2e", version: "1.0.0" });
@@ -115,7 +116,8 @@ describe("multi-account behaviour (drafts mode)", () => {
   it("reports a broken account without failing the others", async () => {
     const credPath = path.join(home, "accounts", "psdgator", "credentials.json");
     const good = fs.readFileSync(credPath, "utf8");
-    fs.writeFileSync(credPath, JSON.stringify({ ...JSON.parse(good), access_token: "revoked" }));
+    expect(JSON.parse(good).alg).toBe("A256GCM"); // stored encrypted after startup migration
+    fs.writeFileSync(credPath, JSON.stringify({ access_token: "revoked", refresh_token: "r", expiry_date: Date.now() + 3600_000 }));
     try {
       const r = await call(client, "search_emails", { query: "" });
       expect(r.results.every((m: { account: string }) => m.account === "urbanstickers")).toBe(true);
