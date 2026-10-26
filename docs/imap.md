@@ -53,7 +53,9 @@ Message ids look like `INBOX:1234` (folder:UID). A message gets a new id when it
 
 ### Deleting and moving safely
 
-Removing a message from a folder (deleting a draft, or a move on a server without the `MOVE` extension) ends with an IMAP `EXPUNGE`. With the `UIDPLUS` extension (Dovecot, Cyrus, Gmail, most current servers) only the messages acted on are removed (`UID EXPUNGE`). Without it, a plain `EXPUNGE` would also erase every other message in that folder that another mail app has marked as deleted but not yet removed. So on such servers the action is only done when no other message there is marked deleted; otherwise it is refused with a message asking you to empty or compact that folder in your mail app first. Moves on servers with `MOVE` never need this.
+Removing a message from a folder (deleting a draft, or a move on a server without the `MOVE` extension) ends with an IMAP `EXPUNGE`. With the `UIDPLUS` extension (Dovecot, Cyrus, Gmail, most current servers) only the messages acted on are removed (`UID EXPUNGE`). Without it, a plain `EXPUNGE` would also erase every other message in that folder that another mail app has marked as deleted but not yet removed. So on such servers the action is only done when no other message there is marked deleted; otherwise it is refused with a message asking you to empty or compact that folder in your mail app first. Moves on servers with `MOVE` never need this. A small gap remains on such servers: if another mail app marks a message deleted in the few moments between the check and the `EXPUNGE`, that message is removed too. Servers with `UIDPLUS` don't have this gap.
+
+`send_draft` checks this **before** sending, so a draft is only sent when it can be removed afterwards. After sending, the message first loses its `\Draft` flag and is then removed. If removing fails, the email is reported as sent with a warning, and because it is no longer flagged as a draft, no other window or restarted server will send it again.
 
 ## Search syntax supported for IMAP
 

@@ -16,8 +16,10 @@ Start with `gmail-mcp-multi doctor`. It checks the OAuth client file, the encryp
 | `Could not decrypt stored credentials` | The encryption key changed (new machine, keychain reset, or a different `GMAIL_MCP_MASTER_KEY`). Reconnect the account. |
 | `No OS keychain available; stored the encryption key in …master.key` | Normal on headless Linux. Set `GMAIL_MCP_MASTER_KEY` to keep the key outside the config folder. |
 | `… is outside the folders this server may use` / `… hidden file` / `… protected location` | Attachments can only be read from, and saved to, normal folders under your home folder. Add other folders with `GMAIL_MCP_ALLOWED_DIRS` (e.g. `D:\Work`). See [Security → Local files](security.md#local-files). |
-| `… is a program, script or shortcut` from `save_attachment` | The server doesn't save executable or script files from email. If you trust the sender, download it from Gmail yourself. |
-| `This PDF expands to more than 256 MB when decompressed` | The PDF is unusually large inside (or built to exhaust memory). Use `save_attachment` and open it in a PDF viewer. |
+| `… is not a document, image or other file type this server saves` | `save_attachment` only saves [safe file types](security.md#local-files). If you trust the sender, download it from your mail app, or add the extension to `GMAIL_MCP_SAVE_EXTRA_TYPES`. |
+| `This file is too large to read here (memory limit … MB)` | The attachment needs more memory than the reader allows (or was built to exhaust it). Use `save_attachment` and open it in its app, or raise `GMAIL_MCP_EXTRACT_MEMORY_MB`. |
+| `The attachment reader is missing from this installation` | `dist/extract/worker.js` is missing. Reinstall the package (`npm install -g multi-gmail-account-mcp`). |
+| `Refusing a bulk change for this search` | `bulk_cleanup` needs a search that selects specific emails; blank searches, a lone `-`/`OR`, or empty groups like `()` are refused. |
 | `Draft … is already being sent` | Two send requests for the same draft overlapped. Check *Sent* before trying again. |
 | `This search can't be applied exactly on "x"` | `bulk_cleanup` refuses queries the mailbox can't apply exactly (IMAP and Gmail-only operators). Rephrase without the listed parts. |
 | `encrypted with a different key` / `Not creating a new key over existing encrypted logins` | The encryption key is missing or different (new machine, keychain reset, changed `GMAIL_MCP_MASTER_KEY`). Restore it, or remove and reconnect the accounts. |

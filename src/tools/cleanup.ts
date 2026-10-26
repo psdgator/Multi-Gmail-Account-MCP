@@ -66,9 +66,12 @@ function isPrivateIp(ip: string): boolean {
   const v4 = (hi: number, lo: number) => `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
   const zeros = (n: number) => g.slice(0, n).every((x) => x === 0);
   if (zeros(5) && g[5] === 0xffff) return isPrivateIpv4(v4(g[6], g[7])); // ::ffff:a.b.c.d (any notation)
+  if (zeros(4) && g[4] === 0xffff && g[5] === 0) return isPrivateIpv4(v4(g[6], g[7])); // SIIT ::ffff:0:a.b.c.d
   if (zeros(6)) return true; // ::, ::1 and deprecated IPv4-compatible ::a.b.c.d
-  if (g[0] === 0x64 && g[1] === 0xff9b) return true; // NAT64
-  if (g[0] === 0x2002) return true; // 6to4
+  // NAT64 well-known prefix: fine for a public IPv4 behind it (IPv6-only networks), not for a private one.
+  if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((x) => x === 0)) return isPrivateIpv4(v4(g[6], g[7]));
+  if (g[0] === 0x64 && g[1] === 0xff9b) return true; // 64:ff9b:1::/48 local-use NAT64 and other forms
+  if (g[0] === 0x2002) return isPrivateIpv4(v4(g[1], g[2])); // 6to4 embeds an IPv4 address
   if (g[0] === 0x2001 && g[1] === 0) return true; // Teredo
   if (g[0] === 0x2001 && g[1] === 0xdb8) return true; // documentation
   if ((g[0] & 0xfe00) === 0xfc00) return true; // unique local fc00::/7
@@ -290,6 +293,8 @@ export function registerCleanupTools(server: McpServer, ctx: ToolContext): void 
       const [acc] = ctx.accounts.resolve(account, false);
       requireMode(ctx, acc, action === "trash" ? "full" : "drafts", `bulk_cleanup (${action})`);
       if (action === "label" && !label) throw new Error('action "label" needs a label name.');
+      const why = vagueQuery(query);
+      if (why) throw new Error(`Refusing a bulk change for this search: ${why}. Give a search that selects specific emails, e.g. "from:news@shop.example older_than:30d".`);
       const limit = Math.min(max ?? 200, action === "trash" ? 500 : 1000);
       return ctx.mail.with(acc, async (p) => {
         const found = await p.search({ query, max: limit, idsOnly: true });
@@ -385,4 +390,21 @@ export function registerCleanupTools(server: McpServer, ctx: ToolContext): void 
   });
 }
 
-export const _test = { isPrivateIp, WRITES };
+/**
+ * Searches that would select far more than intended in a bulk change, whatever the mailbox:
+ * no real search term ("-", "OR", blanks, invisible characters), or an empty group like "()" /
+ * "-()" (Gmail and IMAP treat those differently). Returns the reason, or undefined if OK.
+ */
+export function vagueQuery(query: string): string | undefined {
+  const q = query.replace(/[\p{Cf}\u180e]/gu, " ");
+  if (/[({]\s*(?:""\s*)*[)}]/.test(q) || /-\s*""/.test(q)) return "it contains an empty group";
+  const words = q
+    .replace(/\b(?:OR|AND)\b/g, " ")
+    .replace(/[-(){}"]/g, " ")
+    .replace(/\b[a-z_][a-z0-9_]*:(?=\s|$)/gi, " ") // "from:" with nothing after it
+    .trim();
+  if (!words) return "it has no search terms";
+  return undefined;
+}
+
+export const _test = { isPrivateIp, WRITES, vagueQuery };

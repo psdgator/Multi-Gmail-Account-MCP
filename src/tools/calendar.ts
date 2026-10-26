@@ -23,11 +23,17 @@ function tzOffsetMinutes(tz: string, at: Date): number {
 
 /** Local wall-clock time in `tz` → UTC Date. */
 export function zonedTime(y: number, mo: number, d: number, h: number, mi: number, tz: string): Date {
-  const guess = Date.UTC(y, mo - 1, d, h, mi);
-  const off1 = tzOffsetMinutes(tz, new Date(guess));
-  const t = guess - off1 * 60_000;
-  const off2 = tzOffsetMinutes(tz, new Date(t));
-  return new Date(guess - off2 * 60_000);
+  const wall = Date.UTC(y, mo - 1, d, h, mi);
+  // The offsets in force a day before and a day after cover any single DST change.
+  const before = tzOffsetMinutes(tz, new Date(wall - 86_400_000));
+  const after = tzOffsetMinutes(tz, new Date(wall + 86_400_000));
+  const fits = [before, after]
+    .map((off) => wall - off * 60_000)
+    .filter((t) => tzOffsetMinutes(tz, new Date(t)) * 60_000 + t === wall)
+    .sort((a, b) => a - b);
+  // Repeated time (clocks went back): the earlier one. Skipped time (clocks went forward,
+  // e.g. 02:30 or a midnight that doesn't exist): move forward by the gap, like Temporal does.
+  return new Date(fits.length ? fits[0] : wall - before * 60_000);
 }
 
 function ymdIn(tz: string, at: Date): [number, number, number] {
@@ -48,6 +54,13 @@ export function addLocalDays(at: Date, n: number, tz: string): Date {
   return zonedTime(cal.getUTCFullYear(), cal.getUTCMonth() + 1, cal.getUTCDate(), h, mi, tz);
 }
 
+/** Start of the local calendar day `n` days after the day containing `at` (n = 0: start of that day). */
+export function localDayStart(at: Date, n: number, tz: string): Date {
+  const [y, m, d] = ymdIn(tz, at);
+  const cal = new Date(Date.UTC(y, m - 1, d + n));
+  return zonedTime(cal.getUTCFullYear(), cal.getUTCMonth() + 1, cal.getUTCDate(), 0, 0, tz);
+}
+
 /** "today" | "tomorrow" | "YYYY-MM-DD" | ISO datetime → Date (start of day for dates, in tz). */
 export function parseWhen(input: string | undefined, tz: string, fallback: Date): Date {
   if (!input) return fallback;
@@ -55,7 +68,7 @@ export function parseWhen(input: string | undefined, tz: string, fallback: Date)
   const now = new Date();
   const [y, m, d] = ymdIn(tz, now);
   if (s === "today" || s === "σήμερα") return zonedTime(y, m, d, 0, 0, tz);
-  if (s === "tomorrow" || s === "αύριο") return addLocalDays(zonedTime(y, m, d, 0, 0, tz), 1, tz);
+  if (s === "tomorrow" || s === "αύριο") return localDayStart(now, 1, tz);
   if (s === "now") return now;
   const dm = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (dm) return zonedTime(Number(dm[1]), Number(dm[2]), Number(dm[3]), 0, 0, tz);
@@ -211,7 +224,8 @@ function registerCalendarToolsInner(server: McpServer, ctx: ToolContext): Regist
     run: async ({ account, from, to, days, query, maxPerAccount }) => {
       const tz = localTimeZone();
       const start = parseWhen(from ?? "today", tz, new Date());
-      const end = to ? parseWhen(to, tz, new Date()) : addLocalDays(start, days ?? 1, tz);
+      const startsDay = start.getTime() === localDayStart(start, 0, tz).getTime();
+      const end = to ? parseWhen(to, tz, new Date()) : startsDay ? localDayStart(start, days ?? 1, tz) : addLocalDays(start, days ?? 1, tz);
       const { usable, skipped } = calendarAccounts(ctx, account);
       const { ok, errors } = await fanOutCal(ctx, usable, (acc) => eventsFor(ctx, acc, start, end, { q: query, max: maxPerAccount }));
       const events = ok.flatMap((r) => r.value).sort((a, b) => (startKey(a) < startKey(b) ? -1 : 1));

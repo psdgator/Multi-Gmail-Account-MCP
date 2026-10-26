@@ -82,13 +82,16 @@ export interface Token {
  * Split into tokens, keeping quoted values together and separating grouping
  * punctuation: from:"Μαρία Π" -"x y" OR (a OR b) {c d}
  */
+/** Whitespace, including invisible characters (zero-width space, word joiner, BOM, Mongolian vowel separator). */
+const SPACE = /[\s\p{Cf}\u180e]/u;
+
 export function tokenize(q: string): Token[] {
   const out: Token[] = [];
   const s = q ?? "";
   let i = 0;
   while (i < s.length) {
     const ch = s[i];
-    if (/\s/.test(ch)) {
+    if (SPACE.test(ch)) {
       i++;
       continue;
     }
@@ -124,7 +127,7 @@ export function tokenize(q: string): Token[] {
       j = end === -1 ? s.length : end + 1;
     } else {
       let k = j;
-      while (k < s.length && !/\s/.test(s[k]) && s[k] !== ")" && s[k] !== "}") k++;
+      while (k < s.length && !SPACE.test(s[k]) && s[k] !== ")" && s[k] !== "}") k++;
       value = s.slice(j, k);
       j = k;
     }
@@ -414,15 +417,27 @@ function toQNode(n: Node, now: Date, ignored: string[]): QNode | undefined {
     }
     case "and":
     case "or": {
-      const items = n.items.map((x) => toQNode(x, now, ignored)).filter((x): x is QNode => Boolean(x));
+      const items = n.items.map((x) => toQNodeReported(x, now, ignored)).filter((x): x is QNode => Boolean(x));
       if (!items.length) return undefined;
       return items.length === 1 ? items[0] : { t: n.type, items };
     }
     case "not": {
-      const item = toQNode(n.item, now, ignored);
+      const item = toQNodeReported(n.item, now, ignored);
       return item ? { t: "not", item } : undefined;
     }
   }
+}
+
+/**
+ * Like toQNode, but a part that vanishes without a reason already in `ignored` (an empty
+ * group such as "()" or "-()") is reported: dropping it silently changes what matches
+ * ("in:inbox -()" would become "in:inbox").
+ */
+function toQNodeReported(n: Node, now: Date, ignored: string[]): QNode | undefined {
+  const before = ignored.length;
+  const r = toQNode(n, now, ignored);
+  if (!r && ignored.length === before) ignored.push("empty group");
+  return r;
 }
 
 /** Does the tree need the provider's exact checks (addresses, time bounds)? */
@@ -473,7 +488,7 @@ export function parseGmailQuery(query: string, now = new Date()): ImapQuery {
     // "-(x)" around a single term is just "-x".
     if (n.type === "not" && n.item.type === "term") n = { type: "term", tok: { ...n.item.tok, neg: !n.item.tok.neg } };
     if (n.type !== "term") {
-      const qn = toQNode(n, now, q.ignored);
+      const qn = toQNodeReported(n, now, q.ignored);
       if (!qn) continue;
       if (hasExact(qn)) q.exact.push(qn);
       else crits.push(...toCrits(qn));

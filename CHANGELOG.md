@@ -39,15 +39,18 @@ First release as **multi-gmail-account-mcp** (fork of dmorrill/gmail-mcp-multi).
   - allowing the home folder no longer opens up AppData / ~/Library
   - network paths are refused in any slash style before the disk is touched
   - files with several hard links are not read
-- **Saved attachments:** programs, scripts, shortcuts and shell profiles are not saved; invisible direction-changing characters and leading dots are removed from names; Windows gets the Mark of the Web.
-- **Unsubscribe:** the one-click check is now DNS-rebinding-safe and also refuses IPv4-mapped and other tunnelled private IPv6 forms; mailto unsubscribes are limited to one address with a fixed body.
+- **Saved attachments:** only known safe file types are saved (documents, images, design and CAD files, media, fonts, plain archives; `GMAIL_MCP_SAVE_EXTRA_TYPES` adds more); invisible direction-changing characters and leading dots are removed from names, and shortening a name can't leave a trailing dot; files get the Mark of the Web on Windows and the quarantine flag on macOS.
+- **Unsubscribe:** the one-click check is now DNS-rebinding-safe and also refuses IPv4-mapped, SIIT and other tunnelled private IPv6 forms (public addresses behind NAT64/6to4 still work); mailto unsubscribes are limited to one address with a fixed body.
 - **Attachments:**
-  - reading runs in a worker thread with time and memory limits, plus a process-memory watchdog and at most two at a time
+  - reading runs in a worker thread with time and memory limits, one at a time
+  - decompression bombs are stopped by a per-buffer size cap inside the worker and a process-memory watchdog
+  - an installed copy refuses to read attachments if the worker is missing, instead of reading without limits
   - parsers are linear-time; the ODS expansion is capped
-  - PDF decompression bombs are refused before parsing
 - **Confirmations** (elicitation) fail closed: no answer, a timeout or an error counts as "no".
 - **Very large HTML emails** are cut before conversion.
-- **send_draft:** overlapping sends of the same draft are refused.
+- **send_draft:** overlapping sends of the same draft are refused. On IMAP, a draft is only sent if it can be removed afterwards, and a sent draft loses its draft flag first, so no other process or restart can send it again.
+- **bulk_cleanup** refuses vague searches (no terms, a lone `-`/`OR`, empty groups like `()`) for Gmail and IMAP, and IMAP reports empty groups instead of dropping them.
+- **Local files:** with several `GMAIL_MCP_ALLOWED_DIRS`, the most specific one decides.
 - **Release workflow:** tests and publishing in separate jobs, OIDC token only in the publish job, install scripts disabled there, actions pinned by commit and the registry publisher by checksum.
 - **Hosted mode:**
   - sign-out works across processes; changing the password signs everyone out
@@ -62,7 +65,7 @@ First release as **multi-gmail-account-mcp** (fork of dmorrill/gmail-mcp-multi).
 - **Encryption key:** never replaced while encrypted logins exist; key fingerprints in envelopes.
 - **Gmail:** search pages beyond 500 results.
 - **Reply-all:** works with group addresses (`undisclosed-recipients:;`).
-- **Calendar:** times are parsed in the configured time zone ("tomorrow" and day ranges are correct across daylight-saving changes); calendar tools appear without a restart.
+- **Calendar:** times are parsed in the configured time zone; "tomorrow" and day ranges are correct across daylight-saving changes, including zones where midnight is skipped; skipped times move forward; calendar tools appear without a restart.
 
 ### Changed
 - Internals rebuilt around a provider layer (`MailProvider`) so every tool works for Gmail and IMAP.

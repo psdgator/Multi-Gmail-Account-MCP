@@ -72,7 +72,11 @@ export function checkPath(input: string, mode: "read" | "write"): string {
   // home-folder rules (e.g. a work folder under AppData); the home folder gets the full checks.
   const roots = allowedRoots();
   const home = roots[0];
-  const explicit = roots.slice(1).find((r) => sameOrInside(cmp, normalizeForCompare(r)));
+  // The most specific allowed folder decides (so "~;~/AppData/Local/Temp" allows Temp).
+  const explicit = roots
+    .slice(1)
+    .filter((r) => sameOrInside(cmp, normalizeForCompare(r)))
+    .sort((a, b) => b.length - a.length)[0];
   const root = explicit ?? (sameOrInside(cmp, normalizeForCompare(home)) ? home : undefined);
   if (!root) {
     throw new PathPolicyError(

@@ -191,10 +191,15 @@ describe("Gmail query -> IMAP search", () => {
   it("reports queries without any usable term; only the empty query means all mail", () => {
     for (const bad of ["OR", "-", '""', "   ", "AND", "OR OR", "()", "-()", "( OR )", '-""']) {
       const r = parseGmailQuery(bad, now);
-      expect(r.ignored, JSON.stringify(bad)).toEqual(["no usable search terms"]);
+      expect(r.ignored.length, JSON.stringify(bad)).toBeGreaterThan(0);
+      expect(r.ignored.join(" "), JSON.stringify(bad)).toMatch(/no usable search terms|empty group/);
       expect(r.criteria).toEqual({ all: true });
     }
     expect(parseGmailQuery("", now).ignored).toEqual([]);
+    // An empty group next to real terms is reported, not silently dropped.
+    for (const q of ["in:inbox -()", 'in:inbox -("")', "-(x OR ())", "a ()"]) expect(parseGmailQuery(q, now).ignored, q).toContain("empty group");
+    // Invisible characters are spaces, not a search term.
+    for (const q of ["\u200b", "\u2060 \ufeff", "\u180e"]) expect(parseGmailQuery(q, now).ignored, JSON.stringify(q)).toEqual(["no usable search terms"]);
     for (const ok of ["in:inbox", "in:anywhere", "has:attachment", "-from:a@b.example", "newer_than:1d", "x OR"]) {
       expect(parseGmailQuery(ok, now).ignored, ok).toEqual([]);
     }
@@ -419,12 +424,13 @@ describe("ImapProvider against a real IMAP + SMTP server", () => {
 
   it("reports a successful send even if removing the draft afterwards fails", async () => {
     const d = await p.saveDraft(buildMime({ from: "antony@psdgator.com", to: ["carol@x.example"], subject: "once", text: "x" }));
-    const orig = p.deleteDraft.bind(p);
-    p.deleteDraft = async () => {
+    const priv = p as unknown as { removeSentDraft: (path: string, uid: number) => Promise<void> };
+    const orig = priv.removeSentDraft;
+    priv.removeSentDraft = async () => {
       throw new Error("server hiccup");
     };
     const r = await p.sendDraft(d.draftId);
-    p.deleteDraft = orig;
+    priv.removeSentDraft = orig;
     expect(servers.sent).toHaveLength(1);
     expect(r.warning).toMatch(/WAS sent.*server hiccup.*do not send it again/);
     // The draft is still there, but this server won't send it a second time.
@@ -629,6 +635,7 @@ describe("ImapProvider on a server without UIDPLUS (and MOVE)", () => {
   let servers: FakeMailServers | undefined;
   let p: ImapProvider | undefined;
   const subjects = (r: { messages: { subject: string }[] }) => r.messages.map((m) => m.subject);
+  let lastAccounts: AccountManager | undefined;
 
   async function start(without: string[]) {
     servers = await startFakeMailServers({ storage: imapStorage(), without });
@@ -636,8 +643,10 @@ describe("ImapProvider on a server without UIDPLUS (and MOVE)", () => {
     const acc = accounts.addAccount("old", "antony@psdgator.com", undefined, {
       type: "imap",
       imap: { host: "127.0.0.1", port: servers.imapPort, secure: false, user: FAKE_IMAP.user, allowInsecureTls: true },
+      smtp: { host: "127.0.0.1", port: servers.smtpPort, secure: false, user: FAKE_IMAP.user, allowInsecureTls: true },
     });
     accounts.saveCredentials("old", { password: FAKE_IMAP.pass });
+    lastAccounts = accounts;
     p = new MailRegistry(accounts).get(acc) as ImapProvider;
     // @ts-expect-error private connection, to act like another mail app
     const c = (await p.conn()) as import("imapflow").ImapFlow;
@@ -648,6 +657,37 @@ describe("ImapProvider on a server without UIDPLUS (and MOVE)", () => {
     await p?.close();
     await servers?.close();
     p = servers = undefined;
+  });
+
+  it("refuses to send a draft it could not remove afterwards (nothing is sent)", async () => {
+    const { p, c } = await start(["UIDPLUS"]);
+    const d = await p.saveDraft(buildMime({ from: "antony@psdgator.com", to: ["bob@client.example"], subject: "mine", text: "x" }));
+    await c.append("Drafts", "From: x@y\r\nSubject: pending deletion\r\nMessage-ID: <pd2@x>\r\n\r\nx", ["\\Draft", "\\Deleted"]);
+    await expect(p.sendDraft(d.draftId)).rejects.toThrow(/no UIDPLUS.*1 other message/);
+    expect(servers!.sent).toHaveLength(0);
+  });
+
+  it("a sent draft that couldn't be removed is no longer a draft, so a restarted server won't send it again", async () => {
+    const { p } = await start(["UIDPLUS"]);
+    const d = await p.saveDraft(buildMime({ from: "antony@psdgator.com", to: ["bob@client.example"], subject: "once only", text: "x" }));
+    // Let the check before sending pass, then fail the removal after the \Draft flag is gone.
+    const priv = p as unknown as { refuseUnsafeExpunge: (...a: unknown[]) => Promise<void> };
+    const refuse = priv.refuseUnsafeExpunge.bind(p);
+    let calls = 0;
+    priv.refuseUnsafeExpunge = async (...args: unknown[]) => {
+      if (++calls > 1) throw new Error("server hiccup");
+      return refuse(...args);
+    };
+    const r = await p.sendDraft(d.draftId);
+    expect(r.warning).toMatch(/WAS sent/);
+    expect(servers!.sent).toHaveLength(1);
+    const fresh = new MailRegistry(lastAccounts!).get(lastAccounts!.requireAccount("old")) as ImapProvider;
+    try {
+      await expect(fresh.sendDraft(d.draftId)).rejects.toThrow(/no \\Draft flag/);
+    } finally {
+      await fresh.close();
+    }
+    expect(servers!.sent).toHaveLength(1);
   });
 
   it("does not expunge other messages marked deleted when deleting a draft", async () => {

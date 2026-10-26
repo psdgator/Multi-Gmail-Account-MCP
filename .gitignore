@@ -36,3 +36,6 @@ client_secret*.json
 # Hosted mode (docker compose)
 secrets/
 docker-compose.override.yml
+
+*.tgz
+*.bundle

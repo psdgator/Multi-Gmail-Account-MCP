@@ -1000,12 +1000,15 @@ export class ImapProvider implements MailProvider {
     this.sendingDrafts.add(key);
     try {
       const { drafts } = await this.requireDraft(draftId); // checked BEFORE anything is sent
+      // Also before sending: the draft must be removable afterwards (see refuseUnsafeExpunge),
+      // or it would stay behind as a draft that another process could send again.
+      await this.withBox(path, (c) => this.refuseUnsafeExpunge(c, path, [uid], false));
       const m = await this.fetchSource(draftId);
       const r = await this.send(m.source.toString("utf8"));
       this.sentDrafts.add(key);
       // Sent. From here on never throw: a retry would send the email twice.
       try {
-        await this.deleteDraft(draftId);
+        await this.removeSentDraft(path, uid);
       } catch (err) {
         return {
           ...r,
@@ -1016,6 +1019,19 @@ export class ImapProvider implements MailProvider {
     } finally {
       this.sendingDrafts.delete(key);
     }
+  }
+
+  /**
+   * After sending: first take away the \Draft flag, so no process (after a restart, another
+   * window) treats the message as a sendable draft even if removing it fails; then remove it.
+   */
+  private async removeSentDraft(path: string, uid: number): Promise<void> {
+    await this.withBox(path, async (c) => {
+      await c.messageFlagsRemove(String(uid), ["\\Draft"], { uid: true }).catch(() => undefined);
+      await this.refuseUnsafeExpunge(c, path, [uid], false);
+      const ok = await c.messageDelete(String(uid), { uid: true });
+      if (!ok) throw new Error(`draft ${encodeId(path, uid)} not found`);
+    });
   }
 
   async needsReply(o: NeedsReplyOptions): Promise<NeedsReplyResult> {

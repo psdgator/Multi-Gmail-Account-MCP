@@ -44,6 +44,7 @@ Everything works with no configuration. These settings are for customising.
 | `GMAIL_MCP_AUDIT` | on | `off` disables the audit log |
 | `GMAIL_MCP_ALLOWED_DIRS` | | Extra folders (outside your home folder) that attachments may be read from and saved to. Separate them with `;` on Windows and `:` elsewhere, e.g. `D:\Work;E:\Clients`. |
 | `GMAIL_MCP_SAVE_DIR` | `~/Downloads/gmail-mcp` | Default folder for `save_attachment` |
+| `GMAIL_MCP_SAVE_EXTRA_TYPES` | | Extra file extensions `save_attachment` may save, e.g. `skp,dwf` ([safe types](security.md#local-files)) |
 
 ### Attachments
 
@@ -51,8 +52,8 @@ Everything works with no configuration. These settings are for customising.
 |---|---|---|
 | `GMAIL_MCP_EXTRACT_TIMEOUT_MS` | `20000` | Time limit for reading one attachment |
 | `GMAIL_MCP_EXTRACT_MEMORY_MB` | `512` | Memory limit for the attachment reader |
-| `GMAIL_MCP_EXTRACT_CONCURRENCY` | `2` | How many attachments may be read at the same time |
-| `GMAIL_MCP_EXTRACT_IN_PROCESS` | | `1` reads attachments without a worker thread (debugging only) |
+| `GMAIL_MCP_EXTRACT_CONCURRENCY` | `1` | How many attachments may be read at the same time (each one gets its own memory budget) |
+| `GMAIL_MCP_EXTRACT_IN_PROCESS` | | `1` reads attachments without a worker thread and **without time or memory limits** (debugging only) |
 
 ### IMAP
 

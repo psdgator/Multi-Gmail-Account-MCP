@@ -3,7 +3,8 @@ import * as path from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AccountConfig } from "../accounts.js";
-import { isRiskyFilename, safeFilename } from "../message.js";
+import { execFile } from "node:child_process";
+import { isSavableFilename, safeFilename } from "../message.js";
 import { checkPath, defaultSaveDir } from "../paths.js";
 import { gmailUrl } from "../providers/gmail.js";
 import type { MailProvider } from "../providers/types.js";
@@ -212,9 +213,10 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
       const { acc, value } = await findInAccounts(ctx, account, `Message ${messageId}`, (p) => p.getAttachment(messageId, { partId, filename }));
       fs.mkdirSync(dir, { recursive: true });
       const clean = safeFilename(value.filename);
-      if (isRiskyFilename(clean)) {
+      if (!isSavableFilename(clean)) {
         throw new Error(
-          `"${clean}" is a program, script or shortcut. For safety it isn't saved automatically; the user can download it from their mail app if they trust it.`
+          `"${clean}" is not a document, image or other file type this server saves (programs, scripts, shortcuts and similar files are refused for safety). ` +
+            "The user can download it from their mail app if they trust it, or add the type to GMAIL_MCP_SAVE_EXTRA_TYPES."
         );
       }
       const ext = path.extname(clean);
@@ -223,15 +225,26 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
       for (let i = 1; fs.existsSync(file); i++) file = path.join(dir, `${stem} (${i})${ext}`);
       checkPath(file, "write"); // the final path must pass the same policy as the folder
       fs.writeFileSync(file, value.data, { flag: "wx" });
-      if (process.platform === "win32") {
-        // Mark-of-the-Web: Windows treats the file as downloaded from the internet.
-        try {
-          fs.writeFileSync(`${file}:Zone.Identifier`, "[ZoneTransfer]\r\nZoneId=3\r\n");
-        } catch {
-          /* not NTFS */
-        }
-      }
+      await markAsDownloaded(file);
       return { account: acc.alias, savedTo: file, filename: path.basename(file), mimeType: value.mimeType, bytes: value.data.length };
     },
   });
+}
+
+/**
+ * Mark a saved file as downloaded from the internet, so the OS warns before it (or anything
+ * unpacked from it) is opened: Mark-of-the-Web on Windows, the quarantine flag (Gatekeeper)
+ * on macOS. Best effort.
+ */
+async function markAsDownloaded(file: string): Promise<void> {
+  if (process.platform === "win32") {
+    try {
+      fs.writeFileSync(`${file}:Zone.Identifier`, "[ZoneTransfer]\r\nZoneId=3\r\n");
+    } catch {
+      /* not NTFS */
+    }
+  } else if (process.platform === "darwin") {
+    const value = `0083;${Math.floor(Date.now() / 1000).toString(16)};gmail-mcp-multi;`;
+    await new Promise<void>((resolve) => execFile("/usr/bin/xattr", ["-w", "com.apple.quarantine", value, file], () => resolve()));
+  }
 }

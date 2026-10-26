@@ -221,25 +221,51 @@ export function safeFilename(name: string): string {
   let s = base
     // control and invisible formatting characters (incl. right-to-left override tricks like "invoice\u202Efdp.exe")
     .replace(/[\u0000-\u001f\u007f-\u009f\p{Cf}]/gu, "")
-    .replace(/[<>:"/\\|?*]/g, "_")
+    .replace(/[<>:"/\\|?*]/g, "_");
+  // Keep the extension when shortening, and shorten BEFORE the clean-up below so a cut
+  // can't leave a trailing dot or space ("…evil.exe." / "…evil.lnk ").
+  if (s.length > 200) {
+    const ext = s.match(/\.[^.\s]{1,16}$/)?.[0] ?? "";
+    s = s.slice(0, 200 - ext.length) + ext;
+  }
+  s = s
     .replace(/[. ]+$/, "")
     .trim()
     // no hidden files (".bashrc", ".zshenv"…)
     .replace(/^[.\s]+/, "");
   if (!s || s === "." || s === "..") s = "attachment";
   if (/^(con|prn|aux|nul|com\d|lpt\d)(\..*)?$/i.test(s)) s = `_${s}`;
-  return s.slice(0, 200);
+  return s;
 }
 
 /**
- * File types an email should never be able to drop on disk through Claude: programs,
- * scripts, shortcuts and shell/PowerShell profiles. The user can still save them by hand.
+ * File types save_attachment writes to disk: documents, images, design/CAD files, media and
+ * plain archives. Everything else (programs, scripts, shortcuts, installers, disk images,
+ * Windows library/search/theme files that leak credentials when a folder is viewed, macro
+ * documents…) is refused; the user can still save it by hand from their mail app.
+ * Add types with GMAIL_MCP_SAVE_EXTRA_TYPES ("dwg,step").
  */
-export function isRiskyFilename(name: string): boolean {
-  const n = name.toLowerCase();
-  if (/(^|[\\/])(profile|microsoft\.powershell_profile|microsoft\.vscode_profile)\.ps1$/.test(n)) return true;
-  if (/^(bashrc|bash_profile|zshrc|zshenv|zprofile|profile|login|logout|cshrc|tcshrc)$/.test(n)) return true;
-  return /\.(exe|com|bat|cmd|ps1|psm1|psd1|ps1xml|vbs|vbe|js|jse|mjs|cjs|wsf|wsh|hta|scr|pif|cpl|msc|msi|msp|msix|appx|appxbundle|lnk|url|scf|reg|inf|dll|sys|jar|sh|bash|zsh|command|tool|app|pkg|dmg|desktop|py|pyw|pl|rb|php|applescript|scpt|workflow|xll|iso|img|vhd|vhdx)$/.test(
-    n
-  );
+export const SAVABLE_EXTENSIONS = new Set(
+  (
+    "pdf txt csv tsv md json xml yaml yml log rtf eml ics vcf " +
+    "doc docx dotx xls xlsx xltx ppt pptx potx ppsx odt ods odp odg pages numbers key " +
+    "jpg jpeg jpe png gif webp bmp tif tiff heic heif avif svg ico raw cr2 cr3 nef arw dng " +
+    "ai eps psd psb indd idml cdr afdesign afphoto afpub sketch fig xd " +
+    "stl 3mf obj step stp iges igs dxf dwg gcode " +
+    "mp3 m4a wav flac ogg opus aac mp4 m4v mov webm avi mkv " +
+    "zip 7z rar tar gz tgz bz2 xz " +
+    "ttf otf woff woff2"
+  ).split(" ")
+);
+
+/** Whether save_attachment may write a file with this (already cleaned) name. */
+export function isSavableFilename(name: string): boolean {
+  const m = name.toLowerCase().match(/\.([a-z0-9]{1,10})$/);
+  if (!m) return false;
+  const extra = (process.env.GMAIL_MCP_SAVE_EXTRA_TYPES ?? "")
+    .toLowerCase()
+    .split(/[,;\s]+/)
+    .map((e) => e.replace(/^\./, ""))
+    .filter(Boolean);
+  return SAVABLE_EXTENSIONS.has(m[1]) || extra.includes(m[1]);
 }
