@@ -1,6 +1,7 @@
 name: Release
 
-# Push a tag like v0.3.0 to publish to npm and the MCP Registry.
+# Push a tag like v0.3.0 to publish to npm (needs the NPM_TOKEN secret unless the
+# version was already published by hand) and to the MCP Registry (GitHub OIDC).
 on:
   push:
     tags: ["v*"]
@@ -29,8 +30,15 @@ jobs:
       - run: npm ci
       - run: npm test
 
-      - name: Publish to npm
-        run: npm publish --provenance --access public
+      - name: Publish to npm (skipped if this version is already published)
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION is already on npm (published by hand); skipping."
+          else
+            npm publish --provenance --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
