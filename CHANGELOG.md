@@ -57,7 +57,10 @@ First release as **multi-gmail-account-mcp** (fork of dmorrill/gmail-mcp-multi).
   - one password guess per sign-in request; password checks run one at a time server-wide (about 2.5 guesses per second in total), with a bounded queue
   - rate limits on the sign-in endpoints; lockout is per IP / IPv6 /64, escalating to the /48, with no global lock-out of the owner
   - limiter and pending sign-in maps are bounded
-  - the auth file is written atomically, refuses to overwrite changes made by another process, and fails closed if it can't be re-read (`http-logout` resets it)
+  - the auth file is written atomically under a cross-process lock (so `http-logout` can't be undone by a server writing at the same moment), refuses to overwrite changes made by another process, and fails closed if it can't be re-read (`http-logout` resets it)
+  - client registration keeps only the metadata the server needs (8 kB request limit, 4 kB per stored client) and is rate-limited per IPv4 address / IPv6 /48
+  - your sign-in can't be crowded out: locked networks get an answer at once, each network may hold only a few places in the password queue and a limited number of pending sign-ins and never-used clients, and never-used clients expire
+  - sign-ins are logged with the client address
   - unused OAuth clients are evicted
   - refresh tokens have a grace window
   - one shared mail connection pool
