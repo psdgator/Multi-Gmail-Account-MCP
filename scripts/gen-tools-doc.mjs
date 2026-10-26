@@ -50,7 +50,7 @@ if (others.length) GROUPS.push(["Other", others]);
 const typeOf = (s) => {
   if (!s) return "";
   if (s.anyOf) return s.anyOf.map(typeOf).join(" or ");
-  if (s.enum) return s.enum.map((v) => `\`${v}\``).join(" \\| ");
+  if (s.enum) return s.enum.map((v) => `\`${v}\``).join(" / ");
   if (s.type === "array") return `${typeOf(s.items)}[]`;
   return s.type ?? "";
 };
