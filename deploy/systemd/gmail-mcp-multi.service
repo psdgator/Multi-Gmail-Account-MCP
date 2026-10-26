@@ -1,0 +1,49 @@
+# Bare-metal alternative to Docker. Install:
+#   sudo useradd --system --home /var/lib/gmail-mcp-multi --shell /usr/sbin/nologin gmailmcp
+#   sudo git clone https://github.com/psdgator/Multi-Gmail-Account-MCP /opt/gmail-mcp-multi
+#   cd /opt/gmail-mcp-multi && sudo npm ci --include=dev && sudo npm run build
+#   sudo cp deploy/systemd/gmail-mcp-multi.service /etc/systemd/system/
+#   sudo install -m 600 -o root /dev/null /etc/gmail-mcp-multi.env   # then edit it (see below)
+#   sudo systemctl enable --now gmail-mcp-multi
+# Put Caddy/nginx in front for HTTPS (proxy to 127.0.0.1:8787).
+#
+# /etc/gmail-mcp-multi.env:
+#   GMAIL_MCP_PUBLIC_URL=https://mail-mcp.example.com
+#   GMAIL_MCP_HTTP_PASSWORD=...
+#   GMAIL_MCP_MASTER_KEY=...
+#   GMAIL_MCP_MODE=drafts
+
+[Unit]
+Description=gmail-mcp-multi hosted MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gmailmcp
+Group=gmailmcp
+EnvironmentFile=/etc/gmail-mcp-multi.env
+Environment=GMAIL_MCP_HOME=/var/lib/gmail-mcp-multi
+Environment=GMAIL_MCP_KEYRING=0
+Environment=GMAIL_MCP_NO_BROWSER=1
+ExecStart=/usr/bin/node /opt/gmail-mcp-multi/dist/index.js serve-http --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=5
+
+StateDirectory=gmail-mcp-multi
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

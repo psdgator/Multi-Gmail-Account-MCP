@@ -32,3 +32,7 @@ coverage/
 
 # Google OAuth client downloads
 client_secret*.json
+
+# Hosted mode (docker compose)
+secrets/
+docker-compose.override.yml

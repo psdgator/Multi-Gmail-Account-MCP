@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.github
+test
+coverage
+*.log
+.env
+secrets
+oauth-keys.json
+credentials.json
+client_secret*.json
