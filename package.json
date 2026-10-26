@@ -42,7 +42,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/psdgator/gmail-mcp-multi.git"
+    "url": "https://github.com/psdgator/Multi-Gmail-Account-MCP.git"
   },
   "dependencies": {
     "@googleapis/gmail": "^22.0.2",

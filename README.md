@@ -50,8 +50,8 @@ Requires **Node.js 20.19+**.
 ### 1. Install
 
 ```bash
-git clone https://github.com/psdgator/gmail-mcp-multi.git
-cd gmail-mcp-multi
+git clone https://github.com/psdgator/Multi-Gmail-Account-MCP.git
+cd Multi-Gmail-Account-MCP
 npm install        # also builds dist/
 ```
 
@@ -136,6 +136,6 @@ npm test      # unit tests + end-to-end tests against a fake Gmail API (no real 
 - Per-account OAuth clients, standalone auth, read-only switch: **Vadim Zaliva** (PR #13)
 - Attachments, RFC 2047 subjects, labels and filters: **Bobby Marko** (PRs #9, #10, #11)
 - Attachment download: PR #14
-- Multi-account fan-out, modes, drafts/replies, rewrite: **Antonis Papamichail** ([psdgator](https://github.com/psdgator))
+- Multi-account fan-out, modes, drafts/replies, rewrite: **Antonis Papamichail** ([psdgator](https://github.com/psdgator/Multi-Gmail-Account-MCP))
 
 MIT licensed.
