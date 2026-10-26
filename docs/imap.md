@@ -29,18 +29,18 @@ For non-interactive setups, set `GMAIL_MCP_IMAP_PASSWORD` instead of typing the 
 ### Hetzner (KonsoleH / your-server.de mail)
 
 ```bash
-gmail-mcp-multi add-imap psdgator antony@psdgator.com --host mail.your-server.de --name "Antony Papamichail"
+gmail-mcp-multi add-imap company you@yourdomain.com --host mail.your-server.de --name "Your Name"
 ```
 
 - IMAP: `mail.your-server.de`, port 993 (TLS). SMTP: the same host, port 465 (TLS), or 587 with `--smtp-port 587`.
 - The login is the full mailbox address. Use `--user` only if your mailbox has a different login name.
-- If the mailbox lives on your own (managed) server name, for example `dedi5428.your-server.de`, that host works too.
+- If your mailboxes live on a managed server with its own name (for example `dediNNNN.your-server.de`), that host works too.
 
 ## How Gmail ideas map to IMAP
 
 | Gmail | IMAP account |
 |---|---|
-| Labels | Folders. `addLabels` **copies** the message into the folder; `removeLabels` (when the message is in that folder) moves it back to INBOX. `create_label "Clients/Kentia"` creates nested folders. |
+| Labels | Folders. `addLabels` **copies** the message into the folder; `removeLabels` (when the message is in that folder) moves it back to INBOX. `create_label "Clients/Acme"` creates nested folders. |
 | Archive | Moves to the Archive folder (special-use `\Archive`, or a folder named Archive; created if missing). |
 | Trash | Moves to Trash (`\Trash`). |
 | Drafts | Saved in the Drafts folder with the `\Draft` flag. Open them in your mail app (Thunderbird, webmail). |

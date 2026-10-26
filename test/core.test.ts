@@ -115,7 +115,7 @@ describe("automated-mail heuristic", () => {
     expect(looksAutomated("no-reply@accounts.google.com", {})).toBe(true);
     expect(looksAutomated("Shop <news@shop.gr>", { "list-unsubscribe": "<mailto:u@shop.gr>" })).toBe(true);
     expect(looksAutomated("x@y.com", { "auto-submitted": "auto-replied" })).toBe(true);
-    expect(looksAutomated("Γιάννα <gianna@kentia.example>", { "auto-submitted": "no" })).toBe(false);
+    expect(looksAutomated("Μαρία <maria@acme.example>", { "auto-submitted": "no" })).toBe(false);
   });
 });
 

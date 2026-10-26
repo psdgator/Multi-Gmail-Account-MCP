@@ -21,8 +21,8 @@ describe("Gmail query -> IMAP search", () => {
   const now = new Date("2026-10-26T12:00:00Z");
 
   it("tokenizes operators, quotes, negation and OR", () => {
-    expect(tokenize('from:"Γιάννα Π" -subject:x OR "big deal" in:sent')).toEqual([
-      { neg: false, op: "from", value: "Γιάννα Π" },
+    expect(tokenize('from:"Μαρία Π" -subject:x OR "big deal" in:sent')).toEqual([
+      { neg: false, op: "from", value: "Μαρία Π" },
       { neg: true, op: "subject", value: "x" },
       { neg: false, value: "OR", or: true },
       { neg: false, op: undefined, value: "big deal" },
@@ -31,11 +31,11 @@ describe("Gmail query -> IMAP search", () => {
   });
 
   it("maps common operators", () => {
-    const q = parseGmailQuery("from:a@b.com is:unread has:attachment after:2026/10/01 in:sent label:Clients/Kentia larger:2m category:promotions", now);
+    const q = parseGmailQuery("from:a@b.com is:unread has:attachment after:2026/10/01 in:sent label:Clients/Acme larger:2m category:promotions", now);
     expect(q.criteria).toEqual({ from: "a@b.com", seen: false, since: new Date(Date.UTC(2026, 9, 1)), larger: 2 * 1024 * 1024 });
     expect(q.hasAttachment).toBe(true);
     expect(q.roles).toEqual(["sent"]);
-    expect(q.folders).toEqual(["Clients/Kentia"]);
+    expect(q.folders).toEqual(["Clients/Acme"]);
     expect(q.ignored).toEqual(["category:promotions"]);
   });
 
@@ -98,7 +98,7 @@ describe("ImapProvider against a real IMAP + SMTP server", () => {
   it("searches newest-first with Gmail syntax and decodes Greek", async () => {
     expect(subjects(await p.search({ query: "", max: 10 }))).toEqual(["note to self", "Weekly deals", "Προσφορά βιτρίνας", "Ερώτηση για τιμολόγιο", "Old thing"]);
     expect(subjects(await p.search({ query: "is:unread", max: 10 }))).toEqual(["Weekly deals", "Προσφορά βιτρίνας"]);
-    expect(subjects(await p.search({ query: "from:gianna@kentia.example", max: 10 }))).toEqual(["Προσφορά βιτρίνας"]);
+    expect(subjects(await p.search({ query: "from:maria@acme.example", max: 10 }))).toEqual(["Προσφορά βιτρίνας"]);
     expect(subjects(await p.search({ query: "has:attachment", max: 10 }))).toEqual(["Προσφορά βιτρίνας"]);
     expect(subjects(await p.search({ query: "newer_than:2d", max: 10 }))).toEqual(["note to self", "Weekly deals", "Προσφορά βιτρίνας"]);
     expect(subjects(await p.search({ query: "-from:shop.example newer_than:2d", max: 10 }))).toEqual(["note to self", "Προσφορά βιτρίνας"]);
@@ -106,7 +106,7 @@ describe("ImapProvider against a real IMAP + SMTP server", () => {
     expect(subjects(await p.search({ query: '"Big savings"', max: 10 }))).toEqual(["Weekly deals"]);
     expect(subjects(await p.search({ query: "big savings week", max: 10 }))).toEqual(["Weekly deals"]); // repeated TEXT keys nest correctly
     expect(subjects(await p.search({ query: "big -savings", max: 10 }))).toEqual([]);
-    expect(subjects(await p.search({ query: "-from:shop.example -from:gianna -from:carol in:inbox", max: 10 }))).toEqual(["note to self", "Ερώτηση για τιμολόγιο"]);
+    expect(subjects(await p.search({ query: "-from:shop.example -from:maria -from:carol in:inbox", max: 10 }))).toEqual(["note to self", "Ερώτηση για τιμολόγιο"]);
     expect(subjects(await p.search({ query: "in:sent", max: 10 }))).toEqual(["Re: Ερώτηση για τιμολόγιο"]);
 
     const page1 = await p.search({ query: "", max: 2 });
@@ -114,15 +114,15 @@ describe("ImapProvider against a real IMAP + SMTP server", () => {
     expect(page1.estimate).toBe(5);
     expect(subjects(await p.search({ query: "", max: 2, pageToken: page1.next }))).toEqual(["Προσφορά βιτρίνας", "Ερώτηση για τιμολόγιο"]);
 
-    const k = (await p.search({ query: "from:gianna", max: 1, headers: ["List-Unsubscribe"] })).messages[0];
-    expect(k).toMatchObject({ account: "hetzner", from: "Γιάννα <gianna@kentia.example>", cc: "boss@kentia.example", unread: true, rfcMessageId: "<k1@kentia.example>", labels: ["INBOX"] });
+    const k = (await p.search({ query: "from:maria", max: 1, headers: ["List-Unsubscribe"] })).messages[0];
+    expect(k).toMatchObject({ account: "hetzner", from: "Μαρία <maria@acme.example>", cc: "boss@acme.example", unread: true, rfcMessageId: "<k1@acme.example>", labels: ["INBOX"] });
     const n = (await p.search({ query: "from:shop.example", max: 1, headers: ["List-Unsubscribe"] })).messages[0];
     expect(n.headers?.["list-unsubscribe"]).toContain("https://shop.example/unsub");
   });
 
   it("reads status, messages, attachments and threads", async () => {
     expect(await p.inboxStatus()).toEqual({ unread: 2, total: 5 });
-    const k = (await p.search({ query: "from:gianna", max: 1 })).messages[0];
+    const k = (await p.search({ query: "from:maria", max: 1 })).messages[0];
     const full = await p.getMessage(k.id, {});
     expect(full.body).toBe("Καλημέρα");
     expect(full.bodyFormat).toBe("html-converted");
@@ -157,7 +157,7 @@ describe("ImapProvider against a real IMAP + SMTP server", () => {
     const all = (await p.search({ query: "", max: 10 })).messages;
     const news = all.find((m) => m.subject === "Weekly deals")!;
     const old = all.find((m) => m.subject === "Old thing")!;
-    const kentia = all.find((m) => m.subject === "Προσφορά βιτρίνας")!;
+    const acme = all.find((m) => m.subject === "Προσφορά βιτρίνας")!;
 
     await p.modify([news.id], { markRead: true, star: true });
     const news2 = (await p.search({ query: "from:shop.example", max: 1 })).messages[0];
@@ -168,14 +168,14 @@ describe("ImapProvider against a real IMAP + SMTP server", () => {
     expect(subjects(await p.search({ query: "in:archive", max: 5 }))).toEqual(["Old thing"]);
     expect(subjects(await p.search({ query: "", max: 10 }))).not.toContain("Old thing");
 
-    const label = await p.createLabel("Clients/Kentia");
-    expect(label.name).toBe("Clients/Kentia");
-    await p.modify([kentia.id], { addLabels: ["clients/kentia"] });
-    expect(subjects(await p.search({ query: 'label:"Clients/Kentia"', max: 5 }))).toEqual(["Προσφορά βιτρίνας"]);
-    expect(subjects(await p.search({ query: "from:gianna", max: 5 }))).toEqual(["Προσφορά βιτρίνας"]); // copy, still in INBOX
+    const label = await p.createLabel("Clients/Acme");
+    expect(label.name).toBe("Clients/Acme");
+    await p.modify([acme.id], { addLabels: ["clients/acme"] });
+    expect(subjects(await p.search({ query: 'label:"Clients/Acme"', max: 5 }))).toEqual(["Προσφορά βιτρίνας"]);
+    expect(subjects(await p.search({ query: "from:maria", max: 5 }))).toEqual(["Προσφορά βιτρίνας"]); // copy, still in INBOX
 
     expect((await p.listLabels()).map((l) => `${l.name}:${l.type}`)).toEqual(
-      expect.arrayContaining(["INBOX:system", "Sent:system", "Archive:system", "Clients:user", "Clients/Kentia:user"])
+      expect.arrayContaining(["INBOX:system", "Sent:system", "Archive:system", "Clients:user", "Clients/Acme:user"])
     );
     await expect(p.modify([news.id], { addLabels: ["Nope"] })).rejects.toThrow(/does not exist/);
 
@@ -186,7 +186,7 @@ describe("ImapProvider against a real IMAP + SMTP server", () => {
   it("finds conversations waiting for a reply", async () => {
     const r = await p.needsReply({ days: 14, max: 10, olderThanHours: 0, skipAutomated: true });
     expect(r.items.map((i) => i.subject)).toEqual(["Προσφορά βιτρίνας"]);
-    expect(r.items[0]).toMatchObject({ account: "hetzner", from: "Γιάννα <gianna@kentia.example>", unread: true, youRepliedEarlier: false, hasDraft: false });
+    expect(r.items[0]).toMatchObject({ account: "hetzner", from: "Μαρία <maria@acme.example>", unread: true, youRepliedEarlier: false, hasDraft: false });
     expect(r.items[0].waitingHours).toBeGreaterThanOrEqual(29);
     expect(r.skippedAutomated).toBe(1);
     const strict = await p.needsReply({ days: 14, max: 10, olderThanHours: 48, skipAutomated: true });
@@ -196,7 +196,7 @@ describe("ImapProvider against a real IMAP + SMTP server", () => {
 
     // A draft reply is reported.
     const h = await p.getOriginalHeaders(r.items[0].lastMessageId);
-    await p.saveDraft(buildMime({ to: ["gianna@kentia.example"], subject: "Re: x", text: "...", inReplyTo: h.rfcMessageId, references: h.rfcMessageId }));
+    await p.saveDraft(buildMime({ to: ["maria@acme.example"], subject: "Re: x", text: "...", inReplyTo: h.rfcMessageId, references: h.rfcMessageId }));
     const withDraft = await p.needsReply({ days: 14, max: 10, olderThanHours: 0, skipAutomated: true });
     expect(withDraft.items[0].hasDraft).toBe(true);
   });
@@ -331,12 +331,12 @@ describe("MCP server with a Gmail and an IMAP account", () => {
   });
 
   it("reads an IMAP message without being told the account, and drafts a reply", async () => {
-    const s = await call("search_emails", { query: "from:gianna", account: "hetzner" });
+    const s = await call("search_emails", { query: "from:maria", account: "hetzner" });
     const id = s.results[0].id;
     const msg = await call("read_email", { messageId: id });
     expect(msg).toMatchObject({ account: "hetzner", body: "Καλημέρα" });
-    const d = await call("create_draft", { account: "hetzner", replyToMessageId: id, replyAll: true, body: "Καλημέρα Γιάννα!" });
-    expect(d).toMatchObject({ status: "draft_saved_not_sent", account: "hetzner", subject: "Re: Προσφορά βιτρίνας", to: ["Γιάννα <gianna@kentia.example>"], cc: ["boss@kentia.example"] });
+    const d = await call("create_draft", { account: "hetzner", replyToMessageId: id, replyAll: true, body: "Καλημέρα Μαρία!" });
+    expect(d).toMatchObject({ status: "draft_saved_not_sent", account: "hetzner", subject: "Re: Προσφορά βιτρίνας", to: ["Μαρία <maria@acme.example>"], cc: ["boss@acme.example"] });
     expect(d.draftId).toMatch(/^Drafts:\d+$/);
     const drafts = await call("list_drafts", { account: "hetzner" });
     expect(drafts.accounts[0].drafts[0].subject).toBe("Re: Προσφορά βιτρίνας");

@@ -14,8 +14,8 @@ const b64u = (s: string | Buffer) => Buffer.from(s).toString("base64url");
 describe("mime", () => {
   it("encodes Greek subjects and names so they survive a round trip", async () => {
     const raw = buildMime({
-      from: "Αντώνης Παπαμιχαήλ <antony@psdgator.com>",
-      to: ["Γιάννα <gianna@example.gr>", "plain@example.com"],
+      from: "Αντώνης Παπαδόπουλος <antony@psdgator.com>",
+      to: ["Μαρία <maria@example.gr>", "plain@example.com"],
       subject: "Προσφορά για αυτοκόλλητα βιτρίνας — μεγάλο θέμα με πολλούς χαρακτήρες για να σπάσει σε κομμάτια",
       text: "Γεια σας,\nσας στέλνω την προσφορά.\n",
     });
@@ -23,10 +23,10 @@ describe("mime", () => {
     for (const line of raw.split("\r\n")) expect(line.length).toBeLessThanOrEqual(998);
     const parsed = await simpleParser(raw);
     expect(parsed.subject).toBe("Προσφορά για αυτοκόλλητα βιτρίνας — μεγάλο θέμα με πολλούς χαρακτήρες για να σπάσει σε κομμάτια");
-    expect(parsed.from?.value[0]).toMatchObject({ name: "Αντώνης Παπαμιχαήλ", address: "antony@psdgator.com" });
+    expect(parsed.from?.value[0]).toMatchObject({ name: "Αντώνης Παπαδόπουλος", address: "antony@psdgator.com" });
     const to = Array.isArray(parsed.to) ? parsed.to[0] : parsed.to;
-    expect(to?.value.map((v) => v.address)).toEqual(["gianna@example.gr", "plain@example.com"]);
-    expect(to?.value[0].name).toBe("Γιάννα");
+    expect(to?.value.map((v) => v.address)).toEqual(["maria@example.gr", "plain@example.com"]);
+    expect(to?.value[0].name).toBe("Μαρία");
     expect(parsed.text?.trim()).toBe("Γεια σας,\nσας στέλνω την προσφορά.");
   });
 
@@ -110,8 +110,8 @@ describe("message parsing", () => {
       labelIds: ["INBOX", "UNREAD", "CATEGORY_PROMOTIONS", "Label_7"],
       snippet: "Tom &amp; Jerry &#39;hi&#39;",
       payload: { headers: [{ name: "From", value: "a@b.com" }, { name: "Subject", value: "S" }] },
-    }, { labelNames: new Map([["Label_7", "Clients/Kentia"]]) });
-    expect(c).toMatchObject({ account: "work", unread: true, labels: ["INBOX", "Promotions", "Clients/Kentia"], snippet: "Tom & Jerry 'hi'" });
+    }, { labelNames: new Map([["Label_7", "Clients/Acme"]]) });
+    expect(c).toMatchObject({ account: "work", unread: true, labels: ["INBOX", "Promotions", "Clients/Acme"], snippet: "Tom & Jerry 'hi'" });
     expect(decodeEntities("&lt;b&gt;")).toBe("<b>");
   });
 

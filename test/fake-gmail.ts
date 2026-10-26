@@ -62,9 +62,9 @@ export function fixtures(): Record<string, Mailbox> {
           payload: {
             mimeType: "multipart/mixed",
             headers: hdrs({
-              From: "Γιάννα <gianna@kentia.example>",
+              From: "Μαρία <maria@acme.example>",
               To: "urbanstickersgr@gmail.com",
-              Cc: "boss@kentia.example",
+              Cc: "boss@acme.example",
               Subject: "Προσφορά βιτρίνας",
               "Message-ID": "<orig-u1@mail.example>",
             }),

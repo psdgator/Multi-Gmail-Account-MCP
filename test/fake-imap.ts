@@ -41,12 +41,12 @@ export const FAKE_IMAP = {
 export function imapStorage(now = Date.now()) {
   const d = (hoursAgo: number) => new Date(now - hoursAgo * H);
   const pdf = b64("%PDF-1.4 fake floor plan");
-  const kentia = [
-    `From: ${ew("Γιάννα")} <gianna@kentia.example>`,
+  const acme = [
+    `From: ${ew("Μαρία")} <maria@acme.example>`,
     "To: antony@psdgator.com",
-    "Cc: boss@kentia.example",
+    "Cc: boss@acme.example",
     `Subject: ${ew("Προσφορά βιτρίνας", "ISO-8859-7")}`,
-    "Message-ID: <k1@kentia.example>",
+    "Message-ID: <k1@acme.example>",
     `Date: ${d(30).toUTCString()}`,
     "MIME-Version: 1.0",
     'Content-Type: multipart/mixed; boundary="b1"',
@@ -124,7 +124,7 @@ export function imapStorage(now = Date.now()) {
       messages: [
         { raw: bin(carol), flags: ["\\Seen"], internaldate: d(24 * 20) },
         { raw: Buffer.from(bob, "utf8").toString("binary"), flags: ["\\Seen"], internaldate: d(50) },
-        { raw: bin(kentia), flags: [], internaldate: d(30) },
+        { raw: bin(acme), flags: [], internaldate: d(30) },
         { raw: bin(newsletter), flags: [], internaldate: d(5) },
         { raw: bin(self), flags: ["\\Seen"], internaldate: d(1) },
       ],

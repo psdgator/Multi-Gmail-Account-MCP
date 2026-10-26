@@ -61,7 +61,7 @@ beforeAll(async () => {
   home = writeHome();
   const now = Date.now();
   fake.boxes["tok-urban"].calendar!.events.primary.push(
-    { id: "e1", summary: "Μάστορας για βιτρίνα Kentia", start: { dateTime: new Date(now + 3600_000).toISOString() }, end: { dateTime: new Date(now + 2 * 3600_000).toISOString() }, location: "Θεσσαλονίκη" },
+    { id: "e1", summary: "Μάστορας για βιτρίνα Acme", start: { dateTime: new Date(now + 3600_000).toISOString() }, end: { dateTime: new Date(now + 2 * 3600_000).toISOString() }, location: "Θεσσαλονίκη" },
     { id: "e2", summary: "Next week thing", start: { dateTime: new Date(now + 9 * 86_400_000).toISOString() }, end: { dateTime: new Date(now + 9 * 86_400_000 + 3600_000).toISOString() } }
   );
 });
@@ -84,8 +84,8 @@ describe("pure helpers", () => {
     for (const ip of ["8.8.8.8", "2a01:4f8::1"]) expect(_test.isPrivateIp(ip)).toBe(false);
   });
   it("folds Greek accents for name matching", () => {
-    expect(fold("Γιάννα")).toBe(fold("ΓΙΑΝΝΑ"));
-    expect(fold("Παπαμιχαήλ")).toBe("παπαμιχαηλ");
+    expect(fold("Μαρία")).toBe(fold("ΜΑΡΙΑ"));
+    expect(fold("Παπαδόπουλος")).toBe("παπαδοπουλοσ");
     expect(fold("Νίκος")).toBe("νικοσ");
   });
   it("handles time zones for calendar dates", () => {
@@ -140,7 +140,7 @@ describe("drafts mode features", () => {
     expect(urban.newPersonal.map((m: { id: string }) => m.id)).toEqual(["u1"]);
     expect(urban.newSince.automated).toBe(1);
     expect(urban.automatedSenders[0]).toEqual({ from: "Shop News", count: 1 });
-    expect(urban.todaysEvents.map((e: { summary: string }) => e.summary)).toEqual(["Μάστορας για βιτρίνα Kentia"]);
+    expect(urban.todaysEvents.map((e: { summary: string }) => e.summary)).toEqual(["Μάστορας για βιτρίνα Acme"]);
     const psd = r.accounts.find((a: { account: string }) => a.account === "psdgator");
     expect(psd.todaysEvents).toBeUndefined(); // no calendar access there
     expect(r.totals.needsReply).toBeGreaterThanOrEqual(2);
@@ -170,8 +170,8 @@ describe("drafts mode features", () => {
   });
 
   it("find_contact matches names without accents across accounts", async () => {
-    const r = await call(client, "find_contact", { name: "γιαννα" });
-    expect(r.contacts[0]).toMatchObject({ email: "gianna@kentia.example", name: "Γιάννα", accounts: ["urbanstickers"] });
+    const r = await call(client, "find_contact", { name: "μαρια" });
+    expect(r.contacts[0]).toMatchObject({ email: "maria@acme.example", name: "Μαρία", accounts: ["urbanstickers"] });
     const bob = await call(client, "find_contact", { name: "bob" });
     expect(bob.contacts[0].email).toBe("bob@client.example");
     expect(bob.contacts[0].count).toBeGreaterThanOrEqual(2);
@@ -191,9 +191,9 @@ describe("drafts mode features", () => {
 
   it("calendar: list events across accounts and find free time", async () => {
     const ev = await call(client, "list_events", { days: 14 });
-    expect(ev.events.map((e: { summary: string }) => e.summary)).toEqual(["Μάστορας για βιτρίνα Kentia", "Next week thing"]);
+    expect(ev.events.map((e: { summary: string }) => e.summary)).toEqual(["Μάστορας για βιτρίνα Acme", "Next week thing"]);
     expect(ev.skipped).toEqual([{ account: "psdgator", reason: "calendar access not enabled" }]);
-    const q = await call(client, "list_events", { days: 14, query: "kentia" });
+    const q = await call(client, "list_events", { days: 14, query: "acme" });
     expect(q.count).toBe(1);
     const free = await call(client, "find_free_time", { days: 3, durationMinutes: 60, includeWeekends: true });
     expect(free.freeSlots.length).toBeGreaterThan(0);
@@ -238,7 +238,7 @@ describe("full mode features", () => {
   });
 
   it("create_event creates without notifying attendees by default", async () => {
-    const r = await call(client, "create_event", { summary: "Παράδοση αυτοκόλλητων", start: "2026-11-02T10:00", attendees: ["gianna@kentia.example"] });
+    const r = await call(client, "create_event", { summary: "Παράδοση αυτοκόλλητων", start: "2026-11-02T10:00", attendees: ["maria@acme.example"] });
     expect(r).toMatchObject({ status: "created", account: "urbanstickers", invitationsSent: false });
     const ev = fake.boxes["tok-urban"].calendar!.events.primary.at(-1)!;
     expect(ev.start).toEqual({ dateTime: "2026-11-02T10:00:00", timeZone: "Europe/Athens" });

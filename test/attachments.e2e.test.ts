@@ -50,7 +50,7 @@ beforeAll(async () => {
     payload: {
       mimeType: "multipart/mixed",
       headers: [
-        { name: "From", value: "Γιάννα <gianna@kentia.example>" },
+        { name: "From", value: "Μαρία <maria@acme.example>" },
         { name: "To", value: "urbanstickersgr@gmail.com" },
         { name: "Subject", value: "Αρχεία παραγγελίας" },
       ],
@@ -111,7 +111,7 @@ describe("read_attachment through the MCP server", () => {
     const r = await call("read_attachment", { messageId: "a1", account: "urbanstickers", partId: "2", sheet: "Παραγγελίες" });
     const j = JSON.parse((r.content[0] as { text: string }).text);
     expect(j.sheets).toEqual(["Παραγγελίες", "Secret"]);
-    expect(j.text).toContain("Kentia Α.Ε.,2026-10-26,1234.5,TRUE");
+    expect(j.text).toContain("Acme Α.Ε.,2026-10-26,1234.5,TRUE");
     expect(j.text).not.toContain("hidden data");
   });
 

@@ -163,19 +163,19 @@ describe("multi-account behaviour (drafts mode)", () => {
       account: "urbanstickers",
       replyToMessageId: "u1",
       replyAll: true,
-      body: "Καλημέρα Γιάννα,\nσας στέλνω την προσφορά.",
+      body: "Καλημέρα Μαρία,\nσας στέλνω την προσφορά.",
     });
     expect(r.status).toBe("draft_saved_not_sent");
     expect(r.threadId).toBe("tu1");
-    expect(r.to).toEqual(["Γιάννα <gianna@kentia.example>"]);
-    expect(r.cc).toEqual(["boss@kentia.example"]);
+    expect(r.to).toEqual(["Μαρία <maria@acme.example>"]);
+    expect(r.cc).toEqual(["boss@acme.example"]);
     expect(r.subject).toBe("Re: Προσφορά βιτρίνας");
     const raw = Buffer.from(fake.boxes["tok-urban"].drafts[0].message.raw!, "base64url").toString("utf8");
     const parsed = await simpleParser(raw);
     expect(parsed.inReplyTo).toBe("<orig-u1@mail.example>");
     expect(parsed.subject).toBe("Re: Προσφορά βιτρίνας");
     expect(parsed.from?.text).toContain("UrbanStickers");
-    expect(parsed.text).toContain("Καλημέρα Γιάννα");
+    expect(parsed.text).toContain("Καλημέρα Μαρία");
     expect(parsed.text).toContain("urbanstickers.gr");
     expect(parsed.html).toContain("gmail_signature");
     expect(fake.requests.some((x) => x.includes("/messages/send"))).toBe(false);

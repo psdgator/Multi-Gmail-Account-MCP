@@ -36,7 +36,7 @@ interface Token {
   or?: boolean;
 }
 
-/** Split into tokens, keeping quoted values together: from:"Γιάννα Π" -"x y" OR */
+/** Split into tokens, keeping quoted values together: from:"Μαρία Π" -"x y" OR */
 export function tokenize(q: string): Token[] {
   const out: Token[] = [];
   const re = /\s*(-)?(?:([a-zA-Z_]+):)?(?:"([^"]*)"|(\S+))/g;

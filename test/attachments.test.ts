@@ -94,7 +94,7 @@ describe("Office and OpenDocument", () => {
     const r = await extractAttachment(makeXlsx(), "orders.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     expect(r.sheets).toEqual(["Παραγγελίες", "Secret"]);
     expect(r.text).toContain('=== Sheet: Παραγγελίες ===\nΠελάτης,,"Ποσό, € ""τελικό"""');
-    expect(r.text).toContain("Kentia Α.Ε.,2026-10-26,1234.5,TRUE");
+    expect(r.text).toContain("Acme Α.Ε.,2026-10-26,1234.5,TRUE");
     expect(r.text).toContain("Inline ✓,2026-01-02,Πελάτηςx");
     expect(r.text).not.toContain("phonetic");
     expect(r.text).toContain("=== Sheet: Secret (hidden) ===\nhidden data");
@@ -142,12 +142,12 @@ describe("text family", () => {
   });
 
   it("converts HTML, keeps JSON, reads .eml and RTF", async () => {
-    const html = await extractAttachment(Buffer.from("<html><body><h1>Order</h1><p>Hello <b>Γιάννα</b></p><script>x()</script></body></html>"), "o.html", "text/html");
-    expect(html.text).toBe("Order\n\nHello Γιάννα");
+    const html = await extractAttachment(Buffer.from("<html><body><h1>Order</h1><p>Hello <b>Μαρία</b></p><script>x()</script></body></html>"), "o.html", "text/html");
+    expect(html.text).toBe("Order\n\nHello Μαρία");
     const json = await extractAttachment(Buffer.from('{"a":1}'), "data.json", "application/json");
     expect(json.text).toBe('{"a":1}');
     const eml = [
-      "From: =?UTF-8?B?zpPOuc6szr3Ovc6x?= <gianna@kentia.example>",
+      "From: =?UTF-8?B?zpzOsc+Bzq/OsQ==?= <maria@acme.example>",
       "To: urbanstickersgr@gmail.com",
       "Subject: =?UTF-8?B?zqDPgc6/z4POv8+Bzqw=?=",
       "Date: Mon, 26 Oct 2026 09:00:00 +0200",
@@ -157,7 +157,7 @@ describe("text family", () => {
     ].join("\r\n");
     const e = await extractAttachment(Buffer.from(eml), "fwd.eml", "message/rfc822");
     expect(e.format).toBe("eml");
-    expect(e.text).toMatch(/From: "?Γιάννα"? <gianna@kentia\.example>/);
+    expect(e.text).toMatch(/From: "?Μαρία"? <maria@acme\.example>/);
     expect(e.text).toMatch(/Subject: Προσ/);
     expect(e.text).toContain("Σας στέλνω τα σχέδια.");
     const rtf = await extractAttachment(Buffer.from("{\\rtf1\\ansi\\ansicpg1253{\\fonttbl{\\f0 Arial;}}\\f0 \\'c3\\'e5\\'e9\\'e1 \\u963?\\par Line2\\tab X}", "latin1"), "note.rtf", "application/rtf");

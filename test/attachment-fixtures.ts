@@ -44,7 +44,7 @@ export function makeXlsx(opts: { rows?: number } = {}): Buffer {
 <sheet name="Παραγγελίες" sheetId="1" r:id="rId1"/><sheet name="Secret" sheetId="2" state="hidden" r:id="rId2"/></sheets></workbook>`,
     "xl/_rels/workbook.xml.rels": `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="worksheet" Target="/xl/worksheets/sheet2.xml"/></Relationships>`,
-    "xl/sharedStrings.xml": `<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Πελάτης</t></si><si><r><t>Kentia</t></r><r><t xml:space="preserve"> Α.Ε.</t></r></si><si><t>Ποσό, € "τελικό"</t><rPh><t>phonetic</t></rPh></si></sst>`,
+    "xl/sharedStrings.xml": `<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Πελάτης</t></si><si><r><t>Acme</t></r><r><t xml:space="preserve"> Α.Ε.</t></r></si><si><t>Ποσό, € "τελικό"</t><rPh><t>phonetic</t></rPh></si></sst>`,
     "xl/styles.xml": `<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="dd/mm/yyyy;@"/></numFmts>
 <cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="164"/></cellXfs></styleSheet>`,
     "xl/worksheets/sheet1.xml": `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>

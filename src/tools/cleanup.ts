@@ -235,7 +235,7 @@ export function registerCleanupTools(server: McpServer, ctx: ToolContext): void 
     minMode: "readonly",
     annotations: READ_ONLY,
     input: {
-      name: z.string().min(2).describe('Name or part of it, e.g. "Γιάννα", "Kentia", "dhl".'),
+      name: z.string().min(2).describe('Name or part of it, e.g. "Μαρία", "Acme", "dhl".'),
       account: multiAccountArg(ctx),
       max: z.number().int().min(1).max(30).optional().describe("Max addresses (default 10)."),
     },

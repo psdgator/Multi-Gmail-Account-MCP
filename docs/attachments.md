@@ -1,6 +1,6 @@
 # Reading attachments
 
-`read_attachment` lets Claude read what is inside an attachment without you saving it first. Ask things like *"what's the total on the invoice Kentia sent?"*, *"summarise the PDF in the latest email from DHL"* or *"what sizes are in the print spec?"*.
+`read_attachment` lets Claude read what is inside an attachment without you saving it first. Ask things like *"what's the total on the invoice the supplier sent?"*, *"summarise the PDF in the latest email from DHL"* or *"what sizes are in the print spec?"*.
 
 It works for Gmail and IMAP accounts, in every mode (including `readonly`), and through the hosted server.
 
@@ -37,7 +37,7 @@ These can't be read: legacy binary Office (`.doc`, `.xls`, `.ppt`, `.msg`), Post
 
 ```jsonc
 // Read the 2nd page of a PDF
-{ "messageId": "18f…", "account": "urbanstickers", "filename": "invoice.pdf", "pages": "2" }
+{ "messageId": "18f…", "account": "shop", "filename": "invoice.pdf", "pages": "2" }
 
 // One sheet of a workbook
 { "messageId": "18f…", "partId": "2", "sheet": "Παραγγελίες" }
@@ -47,7 +47,7 @@ The result looks like this:
 
 ```json
 {
-  "account": "urbanstickers",
+  "account": "shop",
   "filename": "invoice.pdf",
   "mimeType": "application/pdf",
   "bytes": 48213,
