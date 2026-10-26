@@ -88,4 +88,9 @@ describe("unsubscribe network safety", () => {
   it("blocks NAT64, 6to4 and Teredo too", () => {
     for (const ip of ["64:ff9b::a00:1", "2002:c0a8:101::1", "2001:0:4136:e378::1", "ff02::1"]) expect(_test.isPrivateIp(ip)).toBe(true);
   });
+  it("sees through IPv4-mapped/compatible IPv6 in every notation, and reserved v4 ranges", () => {
+    for (const ip of ["::ffff:7f00:1", "[::ffff:7f00:1]", "::ffff:127.0.0.1", "::ffff:a9fe:a9fe", "::ffff:c0a8:101", "::7f00:1", "::127.0.0.1", "fec0::1", "198.18.0.1", "192.0.0.8", "0:0:0:0:0:ffff:0a00:0001"])
+      expect(_test.isPrivateIp(ip), ip).toBe(true);
+    for (const ip of ["::ffff:8.8.8.8", "::ffff:808:808", "2a00:1450:4001:80b::200e", "1.1.1.1"]) expect(_test.isPrivateIp(ip), ip).toBe(false);
+  });
 });

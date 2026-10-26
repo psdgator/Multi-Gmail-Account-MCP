@@ -423,7 +423,7 @@ _Changes or removes data; Claude should confirm with you first._
 
 ### create_filter
 
-Create a Gmail filter (rule for incoming mail) in one Gmail account. Only available in full mode. Actions: add labels (names or ids), markRead, archive, star, neverSpam. Forwarding is not supported.
+Create a Gmail filter (rule for incoming mail) in one Gmail account. Only available in full mode. Actions: add labels (names), markRead, archive, star, neverSpam. Filters can't delete mail, send it to Spam, or forward it.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|

@@ -35,6 +35,19 @@ function ymdIn(tz: string, at: Date): [number, number, number] {
   return [parts[0], parts[1], parts[2]];
 }
 
+function hmIn(tz: string, at: Date): [number, number] {
+  const p = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(at);
+  return [Number(p.find((x) => x.type === "hour")?.value ?? 0), Number(p.find((x) => x.type === "minute")?.value ?? 0)];
+}
+
+/** Same local wall-clock time `n` calendar days later (correct across DST changes). */
+export function addLocalDays(at: Date, n: number, tz: string): Date {
+  const [y, m, d] = ymdIn(tz, at);
+  const [h, mi] = hmIn(tz, at);
+  const cal = new Date(Date.UTC(y, m - 1, d + n));
+  return zonedTime(cal.getUTCFullYear(), cal.getUTCMonth() + 1, cal.getUTCDate(), h, mi, tz);
+}
+
 /** "today" | "tomorrow" | "YYYY-MM-DD" | ISO datetime → Date (start of day for dates, in tz). */
 export function parseWhen(input: string | undefined, tz: string, fallback: Date): Date {
   if (!input) return fallback;
@@ -42,7 +55,7 @@ export function parseWhen(input: string | undefined, tz: string, fallback: Date)
   const now = new Date();
   const [y, m, d] = ymdIn(tz, now);
   if (s === "today" || s === "σήμερα") return zonedTime(y, m, d, 0, 0, tz);
-  if (s === "tomorrow" || s === "αύριο") return new Date(zonedTime(y, m, d, 0, 0, tz).getTime() + 86_400_000);
+  if (s === "tomorrow" || s === "αύριο") return addLocalDays(zonedTime(y, m, d, 0, 0, tz), 1, tz);
   if (s === "now") return now;
   const dm = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (dm) return zonedTime(Number(dm[1]), Number(dm[2]), Number(dm[3]), 0, 0, tz);
@@ -198,7 +211,7 @@ function registerCalendarToolsInner(server: McpServer, ctx: ToolContext): Regist
     run: async ({ account, from, to, days, query, maxPerAccount }) => {
       const tz = localTimeZone();
       const start = parseWhen(from ?? "today", tz, new Date());
-      const end = to ? parseWhen(to, tz, new Date()) : new Date(start.getTime() + (days ?? 1) * 86_400_000);
+      const end = to ? parseWhen(to, tz, new Date()) : addLocalDays(start, days ?? 1, tz);
       const { usable, skipped } = calendarAccounts(ctx, account);
       const { ok, errors } = await fanOutCal(ctx, usable, (acc) => eventsFor(ctx, acc, start, end, { q: query, max: maxPerAccount }));
       const events = ok.flatMap((r) => r.value).sort((a, b) => (startKey(a) < startKey(b) ? -1 : 1));

@@ -9,7 +9,7 @@ import { looksAutomated } from "../src/providers/types.js";
 import { SecretStore } from "../src/secrets.js";
 import { READ_ONLY_TOOLS } from "../src/audit.js";
 import { createServer } from "../src/server.js";
-import { parseWhen } from "../src/tools/calendar.js";
+import { addLocalDays, parseWhen, zonedTime } from "../src/tools/calendar.js";
 import { mergeAndDedupe } from "../src/tools/common.js";
 import { startFakeGmail } from "./fake-gmail.js";
 
@@ -178,6 +178,12 @@ describe("review fixes", () => {
     s1.write(f, { a: 1 });
     expect(JSON.parse(fs.readFileSync(f, "utf8")).kid).toMatch(/^[0-9a-f]{8}$/);
     expect(new SecretStore(root).read(f)).toEqual({ a: 1 });
+  });
+
+  it("adds calendar days correctly across the October DST change", () => {
+    const sat = zonedTime(2026, 10, 24, 0, 0, "Europe/Athens"); // Sat 00:00 (UTC+3)
+    expect(addLocalDays(sat, 1, "Europe/Athens").toISOString()).toBe("2026-10-24T21:00:00.000Z"); // Sun 00:00 (UTC+3)
+    expect(addLocalDays(sat, 2, "Europe/Athens").toISOString()).toBe("2026-10-25T22:00:00.000Z"); // Mon 00:00 (UTC+2)
   });
 
   it("parses local times in the configured time zone, not the process one", () => {

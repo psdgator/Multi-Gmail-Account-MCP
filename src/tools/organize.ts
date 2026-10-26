@@ -66,7 +66,7 @@ export function registerOrganizeTools(server: McpServer, ctx: ToolContext): void
     title: "Create a filter",
     description:
       "Create a Gmail filter (rule for incoming mail) in one Gmail account. Only available in full mode. " +
-      "Actions: add labels (names or ids), markRead, archive, star, neverSpam. Forwarding is not supported.",
+      "Actions: add labels (names), markRead, archive, star, neverSpam. Filters can't delete mail, send it to Spam, or forward it.",
     minMode: "full",
     annotations: WRITES,
     input: {

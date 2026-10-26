@@ -76,9 +76,14 @@ export function walkParts(root: Part | undefined, visit: (p: Part) => void): voi
   for (const child of root.parts ?? []) walkParts(child, visit);
 }
 
+/** HTML bodies larger than this are cut before conversion (the converter runs on the main thread). */
+export const MAX_HTML_CHARS = 2_000_000;
+
 export function htmlToText(html: string): string {
-  return convert(html, {
+  const cut = html.length > MAX_HTML_CHARS;
+  const text = convert(cut ? html.slice(0, MAX_HTML_CHARS) : html, {
     wordwrap: false,
+    limits: { maxInputLength: MAX_HTML_CHARS, maxDepth: 200, maxChildNodes: 20_000 },
     selectors: [
       { selector: "img", format: "skip" },
       { selector: "style", format: "skip" },
@@ -90,6 +95,7 @@ export function htmlToText(html: string): string {
   })
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+  return cut ? `${text}\n\n[This email is very long; only the first part was converted.]` : text;
 }
 
 export function extractBody(payload: Part | undefined): { text: string; format: "text" | "html-converted" } {
@@ -212,8 +218,28 @@ export function decodeEntities(s: string): string {
 /** Make a filename safe to write on Windows/macOS/Linux. */
 export function safeFilename(name: string): string {
   const base = name.replace(/^.*[\\/]/, "");
-  let s = base.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").replace(/[. ]+$/, "").trim();
+  let s = base
+    // control and invisible formatting characters (incl. right-to-left override tricks like "invoice\u202Efdp.exe")
+    .replace(/[\u0000-\u001f\u007f-\u009f\p{Cf}]/gu, "")
+    .replace(/[<>:"/\\|?*]/g, "_")
+    .replace(/[. ]+$/, "")
+    .trim()
+    // no hidden files (".bashrc", ".zshenv"…)
+    .replace(/^[.\s]+/, "");
   if (!s || s === "." || s === "..") s = "attachment";
   if (/^(con|prn|aux|nul|com\d|lpt\d)(\..*)?$/i.test(s)) s = `_${s}`;
   return s.slice(0, 200);
+}
+
+/**
+ * File types an email should never be able to drop on disk through Claude: programs,
+ * scripts, shortcuts and shell/PowerShell profiles. The user can still save them by hand.
+ */
+export function isRiskyFilename(name: string): boolean {
+  const n = name.toLowerCase();
+  if (/(^|[\\/])(profile|microsoft\.powershell_profile|microsoft\.vscode_profile)\.ps1$/.test(n)) return true;
+  if (/^(bashrc|bash_profile|zshrc|zshenv|zprofile|profile|login|logout|cshrc|tcshrc)$/.test(n)) return true;
+  return /\.(exe|com|bat|cmd|ps1|psm1|psd1|ps1xml|vbs|vbe|js|jse|mjs|cjs|wsf|wsh|hta|scr|pif|cpl|msc|msi|msp|msix|appx|appxbundle|lnk|url|scf|reg|inf|dll|sys|jar|sh|bash|zsh|command|tool|app|pkg|dmg|desktop|py|pyw|pl|rb|php|applescript|scpt|workflow|xll|iso|img|vhd|vhdx)$/.test(
+    n
+  );
 }

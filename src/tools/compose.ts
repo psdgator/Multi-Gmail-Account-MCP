@@ -7,6 +7,9 @@ import type { Identity, MailProvider } from "../providers/types.js";
 import { emailOf } from "../util.js";
 import { DESTRUCTIVE, register, requireMode, singleAccountArg, ToolContext, WRITES } from "./common.js";
 
+/** Drafts currently being sent (account + draft id). */
+const sendingDrafts = new Set<string>();
+
 const escapeHtml = (s: string) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
 const textToHtml = (t: string) => `<div dir="auto">${escapeHtml(t).replace(/\r?\n/g, "<br>")}</div>`;
 
@@ -293,8 +296,16 @@ export function registerComposeTools(server: McpServer, ctx: ToolContext): void 
     run: async ({ draftId, account }) => {
       const [acc] = ctx.accounts.resolve(account, false);
       requireMode(ctx, acc, "full", "send_draft");
-      const r = await ctx.mail.with(acc, (p) => p.sendDraft(draftId));
-      return { status: "sent", account: acc.alias, ...r };
+      // A duplicated or retried call for the same draft must not send it twice.
+      const key = `${acc.alias}\u0000${draftId}`;
+      if (sendingDrafts.has(key)) throw new Error(`Draft ${draftId} is already being sent. Check sent mail before trying again.`);
+      sendingDrafts.add(key);
+      try {
+        const r = await ctx.mail.with(acc, (p) => p.sendDraft(draftId));
+        return { status: "sent", account: acc.alias, ...r };
+      } finally {
+        sendingDrafts.delete(key);
+      }
     },
   });
 }

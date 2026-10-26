@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AccountConfig } from "../accounts.js";
-import { safeFilename } from "../message.js";
+import { isRiskyFilename, safeFilename } from "../message.js";
 import { checkPath, defaultSaveDir } from "../paths.js";
 import { gmailUrl } from "../providers/gmail.js";
 import type { MailProvider } from "../providers/types.js";
@@ -212,11 +212,25 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
       const { acc, value } = await findInAccounts(ctx, account, `Message ${messageId}`, (p) => p.getAttachment(messageId, { partId, filename }));
       fs.mkdirSync(dir, { recursive: true });
       const clean = safeFilename(value.filename);
+      if (isRiskyFilename(clean)) {
+        throw new Error(
+          `"${clean}" is a program, script or shortcut. For safety it isn't saved automatically; the user can download it from their mail app if they trust it.`
+        );
+      }
       const ext = path.extname(clean);
       const stem = clean.slice(0, clean.length - ext.length);
       let file = path.join(dir, clean);
       for (let i = 1; fs.existsSync(file); i++) file = path.join(dir, `${stem} (${i})${ext}`);
+      checkPath(file, "write"); // the final path must pass the same policy as the folder
       fs.writeFileSync(file, value.data, { flag: "wx" });
+      if (process.platform === "win32") {
+        // Mark-of-the-Web: Windows treats the file as downloaded from the internet.
+        try {
+          fs.writeFileSync(`${file}:Zone.Identifier`, "[ZoneTransfer]\r\nZoneId=3\r\n");
+        } catch {
+          /* not NTFS */
+        }
+      }
       return { account: acc.alias, savedTo: file, filename: path.basename(file), mimeType: value.mimeType, bytes: value.data.length };
     },
   });

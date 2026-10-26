@@ -2,33 +2,55 @@ name: Release
 
 # Push a tag like v0.3.0 to publish to npm (needs the NPM_TOKEN secret unless the
 # version was already published by hand) and to the MCP Registry (GitHub OIDC).
+#
+# Hardening: tests run in a job without an OIDC token; the publish job installs with
+# --ignore-scripts, and every third-party action and binary is pinned by hash.
 on:
   push:
     tags: ["v*"]
 
+permissions: {}
+
 jobs:
-  publish:
+  test:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write # npm provenance + MCP Registry OIDC login
       contents: read
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
-
       - name: Check tag matches package.json and server.json
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
           test "$(node -p "require('./package.json').version")" = "$TAG"
           test "$(node -p "require('./server.json').version")" = "$TAG"
           test "$(node -p "require('./server.json').packages[0].version")" = "$TAG"
-
       - run: npm ci
       - run: npm test
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write # npm provenance + MCP Registry OIDC login
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # No dependency install scripts run in the job that holds the OIDC token.
+      - run: npm ci --ignore-scripts
+      - run: npx --no-install tsc -p tsconfig.json
 
       - name: Publish to npm (skipped if this version is already published)
         run: |
@@ -37,20 +59,19 @@ jobs:
           if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
             echo "$NAME@$VERSION is already on npm (published by hand); skipping."
           else
-            npm publish --provenance --access public
+            npm publish --provenance --access public --ignore-scripts
           fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Install mcp-publisher (pinned, checksum verified)
+      - name: Install mcp-publisher (pinned by sha256)
         env:
           MCP_PUBLISHER_VERSION: "1.8.4"
+          MCP_PUBLISHER_SHA256: "5dc2fd415369c73551259f31cd33e2aacc9e0d1021e7f08fef1492d93b781628"
         run: |
-          base="https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}"
           asset="mcp-publisher_linux_amd64.tar.gz"
-          curl -fsSLO "$base/$asset"
-          curl -fsSL "$base/registry_${MCP_PUBLISHER_VERSION}_checksums.txt" -o checksums.txt
-          grep " $asset\$" checksums.txt | sha256sum --check --strict
+          curl -fsSLO "https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}/$asset"
+          echo "${MCP_PUBLISHER_SHA256}  $asset" | sha256sum --check --strict
           tar xzf "$asset" mcp-publisher
 
       - name: Publish to the MCP Registry

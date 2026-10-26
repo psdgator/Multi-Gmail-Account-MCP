@@ -23,25 +23,59 @@ export function parseListUnsubscribe(header: string | undefined, post?: string):
   return out;
 }
 
-function isPrivateIp(ip: string): boolean {
-  if (net.isIPv4(ip)) {
-    const [a, b] = ip.split(".").map(Number);
-    return (
-      a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224
-    );
+/** Expand an IPv6 address to 8 groups of 16 bits (undefined if not IPv6). */
+function ipv6Groups(ip: string): number[] | undefined {
+  let v = ip.toLowerCase().replace(/^\[|\]$/g, "").split("%")[0];
+  if (!net.isIPv6(v)) return undefined;
+  const dotted = v.match(/(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) {
+    const [a, b, c, d] = dotted[1].split(".").map(Number);
+    v = v.slice(0, -dotted[1].length) + `${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
   }
-  const v = ip.toLowerCase();
-  if (v.startsWith("::ffff:")) return isPrivateIp(v.slice(7));
+  const [head, tail] = v.split("::");
+  const h = head ? head.split(":") : [];
+  const t = tail !== undefined ? (tail ? tail.split(":") : []) : [];
+  const groups = tail !== undefined ? [...h, ...Array(8 - h.length - t.length).fill("0"), ...t] : h;
+  return groups.map((g) => parseInt(g || "0", 16));
+}
+
+function isPrivateIpv4(ip: string): boolean {
+  const [a, b, c] = ip.split(".").map(Number);
   return (
-    v === "::1" ||
-    v === "::" ||
-    /^f[cd]/.test(v) || // unique local
-    /^fe[89ab]/.test(v) || // link local
-    v.startsWith("64:ff9b:") || // NAT64 (can reach IPv4 private ranges)
-    v.startsWith("2002:") || // 6to4
-    v.startsWith("2001:0:") || v.startsWith("2001::") || // Teredo
-    v.startsWith("ff") // multicast
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) || // CGNAT
+    (a === 169 && b === 254) || // link local / cloud metadata
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && (c === 0 || c === 2)) || // IETF protocol assignments, TEST-NET-1
+    (a === 192 && b === 88 && c === 99) || // 6to4 relay
+    (a === 198 && (b === 18 || b === 19)) || // benchmarking
+    (a === 198 && b === 51 && c === 100) ||
+    (a === 203 && b === 0 && c === 113) ||
+    a >= 224 // multicast + reserved
   );
+}
+
+function isPrivateIp(ip: string): boolean {
+  const bare = ip.replace(/^\[|\]$/g, "");
+  if (net.isIPv4(bare)) return isPrivateIpv4(bare);
+  const g = ipv6Groups(bare);
+  if (!g) return true; // not an IP we understand: refuse
+  const v4 = (hi: number, lo: number) => `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  const zeros = (n: number) => g.slice(0, n).every((x) => x === 0);
+  if (zeros(5) && g[5] === 0xffff) return isPrivateIpv4(v4(g[6], g[7])); // ::ffff:a.b.c.d (any notation)
+  if (zeros(6)) return true; // ::, ::1 and deprecated IPv4-compatible ::a.b.c.d
+  if (g[0] === 0x64 && g[1] === 0xff9b) return true; // NAT64
+  if (g[0] === 0x2002) return true; // 6to4
+  if (g[0] === 0x2001 && g[1] === 0) return true; // Teredo
+  if (g[0] === 0x2001 && g[1] === 0xdb8) return true; // documentation
+  if ((g[0] & 0xfe00) === 0xfc00) return true; // unique local fc00::/7
+  if ((g[0] & 0xffc0) === 0xfe80) return true; // link local fe80::/10
+  if ((g[0] & 0xffc0) === 0xfec0) return true; // site local fec0::/10
+  if ((g[0] & 0xff00) === 0xff00) return true; // multicast
+  return false;
 }
 
 /**

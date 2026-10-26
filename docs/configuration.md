@@ -51,6 +51,7 @@ Everything works with no configuration. These settings are for customising.
 |---|---|---|
 | `GMAIL_MCP_EXTRACT_TIMEOUT_MS` | `20000` | Time limit for reading one attachment |
 | `GMAIL_MCP_EXTRACT_MEMORY_MB` | `512` | Memory limit for the attachment reader |
+| `GMAIL_MCP_EXTRACT_CONCURRENCY` | `2` | How many attachments may be read at the same time |
 | `GMAIL_MCP_EXTRACT_IN_PROCESS` | | `1` reads attachments without a worker thread (debugging only) |
 
 ### IMAP

@@ -49,8 +49,12 @@ export class PathPolicyError extends Error {}
 /** Resolve and check a path. For writes the path may not exist yet (its closest existing parent is checked). */
 export function checkPath(input: string, mode: "read" | "write"): string {
   const raw = expandHome(input.trim());
-  if (/^(\\\\|\/\/)/.test(raw) || /^\\\\\?\\UNC\\/i.test(raw)) throw new PathPolicyError("Network (UNC) paths are not allowed.");
+  // Network paths, in any slash mix (\\host, //host, /\host, \/host, \\?\UNC\...). Checked
+  // BEFORE touching the filesystem: on Windows even an existence check would contact the
+  // host and leak the user's NTLM credentials.
+  if (/^[\\/]{2}/.test(raw) || /^[\\/]{2}[?.][\\/]/.test(raw)) throw new PathPolicyError("Network (UNC) and device paths are not allowed.");
   let resolved = path.resolve(raw);
+  if (/^[\\/]{2}/.test(resolved)) throw new PathPolicyError("Network (UNC) and device paths are not allowed.");
 
   // Resolve symlinks of the existing part of the path.
   let existing = resolved;
@@ -76,11 +80,22 @@ export function checkPath(input: string, mode: "read" | "write"): string {
     );
   }
 
-  const alwaysDenied = [configDir(), "/proc", "/sys", "/dev", "/etc"];
-  const homeDenied = explicit ? [] : [path.join(os.homedir(), "AppData"), path.join(os.homedir(), "Library")];
-  const deny = [...alwaysDenied, ...homeDenied].map((d) => normalizeForCompare(safeRealpath(d)));
-  if (deny.some((d) => sameOrInside(cmp, d))) {
-    throw new PathPolicyError(`"${input}" is in a protected location (app data, system or this server's own config).`);
+  const alwaysDenied = [configDir(), "/proc", "/sys", "/dev", "/etc"].map((d) => normalizeForCompare(safeRealpath(d)));
+  if (alwaysDenied.some((d) => sameOrInside(cmp, d))) {
+    throw new PathPolicyError(`"${input}" is in a protected location (system or this server's own config).`);
+  }
+  // App data folders hold the Windows Startup folder and macOS LaunchAgents. They stay blocked
+  // unless the user explicitly allowed a folder that is itself INSIDE them (allowing the whole
+  // home folder or a parent does not unblock them). Cloud-drive folders under ~/Library are fine.
+  const homeDenied = [path.join(os.homedir(), "AppData"), path.join(os.homedir(), "Library")].map((d) => normalizeForCompare(safeRealpath(d)));
+  const cloudOk = [path.join(os.homedir(), "Library", "Mobile Documents"), path.join(os.homedir(), "Library", "CloudStorage")].map((d) =>
+    normalizeForCompare(safeRealpath(d))
+  );
+  for (const d of homeDenied) {
+    if (!sameOrInside(cmp, d)) continue;
+    const explicitlyInside = explicit && sameOrInside(normalizeForCompare(explicit), d) && normalizeForCompare(explicit) !== d;
+    if (explicitlyInside || cloudOk.some((c) => sameOrInside(cmp, c))) continue;
+    throw new PathPolicyError(`"${input}" is in a protected location (app data / startup folders).`);
   }
 
   const rel = path.relative(normalizeForCompare(root), cmp);
@@ -90,6 +105,8 @@ export function checkPath(input: string, mode: "read" | "write"): string {
   if (mode === "read") {
     const st = fs.statSync(resolved, { throwIfNoEntry: false });
     if (!st || !st.isFile()) throw new PathPolicyError(`File not found: ${input}`);
+    // A hard link can make a protected file appear inside an allowed folder.
+    if (st.nlink > 1) throw new PathPolicyError(`"${input}" has multiple hard links; refusing to read it.`);
   }
   return resolved;
 }

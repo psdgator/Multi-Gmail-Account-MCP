@@ -73,19 +73,27 @@ export function singleAccountArg(ctx: ToolContext) {
  */
 export async function confirmWithUser(ctx: ToolContext, message: string): Promise<"accepted" | "declined" | "unsupported"> {
   const inner = ctx.server?.server;
-  if (!inner?.getClientCapabilities()?.elicitation) return "unsupported";
+  const caps = inner?.getClientCapabilities()?.elicitation as { form?: unknown; url?: unknown } | undefined;
+  if (!inner || !caps) return "unsupported";
+  // An empty object (older spec) means form elicitation; a URL-only client can't show a yes/no form.
+  const supportsForm = caps.form !== undefined || caps.url === undefined;
+  if (!supportsForm) return "unsupported";
   try {
-    const r = await inner.elicitInput({
-      message,
-      requestedSchema: {
-        type: "object",
-        properties: { confirm: { type: "boolean", title: "Yes, do it", description: message } },
-        required: ["confirm"],
-      },
-    } as never);
+    const r = await inner.elicitInput(
+      {
+        message,
+        requestedSchema: {
+          type: "object",
+          properties: { confirm: { type: "boolean", title: "Yes, do it", description: message } },
+          required: ["confirm"],
+        },
+      } as never,
+      { timeout: 10 * 60_000 }
+    );
     return r.action === "accept" && (r.content as { confirm?: boolean } | undefined)?.confirm === true ? "accepted" : "declined";
   } catch {
-    return "unsupported";
+    // The client said it can ask the user, so any failure (error, timeout, bad answer) is a "no".
+    return "declined";
   }
 }
 

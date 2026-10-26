@@ -4,7 +4,7 @@ import type { AccountConfig } from "../accounts.js";
 import type { CleanMessage } from "../message.js";
 import { looksAutomated, NeedsReplyItem } from "../providers/types.js";
 import { emailOf, nameOf } from "../util.js";
-import { eventsFor, EventSummary, localTimeZone, parseWhen } from "./calendar.js";
+import { addLocalDays, eventsFor, EventSummary, localTimeZone, parseWhen } from "./calendar.js";
 import { multiAccountArg, READ_ONLY, register, ToolContext } from "./common.js";
 
 const AUTO_HEADERS = ["List-Unsubscribe", "List-Id", "Auto-Submitted", "Precedence"];
@@ -70,7 +70,7 @@ export function registerDigestTools(server: McpServer, ctx: ToolContext): void {
       const accs = ctx.accounts.resolve(account, true);
       const tz = localTimeZone();
       const dayStart = parseWhen("today", tz, new Date());
-      const dayEnd = new Date(dayStart.getTime() + 86_400_000);
+      const dayEnd = addLocalDays(dayStart, 1, tz);
 
       const { ok, errors } = await ctx.mail.fanOut(accs, async (p, acc) => {
         const [status, recent, waiting] = await Promise.all([

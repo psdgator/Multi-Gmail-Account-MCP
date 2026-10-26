@@ -1,3 +1,4 @@
+import { Unzlib } from "fflate";
 import { MAX_IMAGE_BYTES } from "./image.js";
 import { tidyText } from "./text.js";
 
@@ -37,7 +38,58 @@ async function quietly<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+export class PdfTooLargeError extends Error {}
+
+/** Max bytes all FlateDecode streams of one PDF may inflate to before we refuse to parse it. */
+export const PDF_INFLATE_BUDGET = 256 * 1024 * 1024;
+
+/**
+ * Decompression-bomb check, run before pdf.js sees the file: test-inflate every
+ * FlateDecode stream (streaming, output discarded) and stop as soon as the total
+ * expanded size exceeds the budget. pdf.js decodes into ArrayBuffers, which the
+ * worker's V8 heap limit does not cover, so this check is what bounds memory.
+ * Linear in the file size; bounded number of streams.
+ */
+export function assertPdfExpansionOk(data: Uint8Array, budget = PDF_INFLATE_BUDGET): void {
+  const text = Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("latin1");
+  let total = 0;
+  let pos = 0;
+  let streams = 0;
+  while (streams < 20_000) {
+    const kw = text.indexOf("stream", pos);
+    if (kw === -1) break;
+    pos = kw + 6;
+    if (text.startsWith("end", kw - 3)) continue; // "endstream"
+    const dictStart = text.lastIndexOf("<<", kw);
+    if (dictStart === -1 || kw - dictStart > 4096) continue;
+    if (!/\/FlateDecode|\/Fl\b/.test(text.slice(dictStart, kw))) continue;
+    let start = kw + 6;
+    if (text[start] === "\r") start++;
+    if (text[start] === "\n") start++;
+    const end = text.indexOf("endstream", start);
+    if (end === -1) break;
+    streams++;
+    let produced = 0;
+    let over = false;
+    const inflater = new Unzlib((chunk) => {
+      produced += chunk.length;
+      if (total + produced > budget) over = true;
+    });
+    try {
+      for (let i = start; i < end && !over; i += 64 * 1024) inflater.push(data.subarray(i, Math.min(end, i + 64 * 1024)), false);
+    } catch {
+      /* corrupt stream: pdf.js will deal with it */
+    }
+    total += produced;
+    if (over || total > budget) {
+      throw new PdfTooLargeError(`This PDF expands to more than ${Math.round(budget / 1024 / 1024)} MB when decompressed (possibly a decompression bomb).`);
+    }
+    pos = end + 9;
+  }
+}
+
 export async function pdfText(data: Uint8Array, opts: { pages?: string; maxChars: number }): Promise<PdfText> {
+  assertPdfExpansionOk(data);
   return quietly(async () => {
     const { getDocumentProxy } = await import("unpdf");
     const pdf = await getDocumentProxy(new Uint8Array(data), {

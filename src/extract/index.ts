@@ -5,7 +5,7 @@ import { Worker } from "node:worker_threads";
 import { htmlToText } from "../message.js";
 import { imageSize, MAX_IMAGE_BYTES, MAX_IMAGE_SIDE, sniffImage } from "./image.js";
 import { docxText, odsText, odtText, pptxText, xlsxText } from "./office.js";
-import { embeddedJpegs, pdfText } from "./pdf.js";
+import { embeddedJpegs, pdfText, PdfTooLargeError } from "./pdf.js";
 import { rtfToText } from "./rtf.js";
 import { charsetFromMime, decodeText, looksLikeText } from "./text.js";
 import { isZip, safeUnzip, utf8, ZipLimitError } from "./zip.js";
@@ -246,7 +246,7 @@ export async function extractInProcess(data: Uint8Array, filename: string, mimeT
       kind: "unsupported",
       format: path.extname(filename).replace(".", "").toLowerCase() || "unknown",
       truncated: false,
-      note: err instanceof ZipLimitError ? msg : `Could not read this file (${msg.slice(0, 200)}). It may be damaged or password-protected; use save_attachment to open it.`,
+      note: err instanceof ZipLimitError ? msg : err instanceof PdfTooLargeError ? `${msg} Use save_attachment to open it.` : `Could not read this file (${msg.slice(0, 200)}). It may be damaged or password-protected; use save_attachment to open it.`,
     };
   }
 }
@@ -274,11 +274,36 @@ export function extractLimits(): { timeoutMs: number; memoryMb: number } {
  * Falls back to in-process extraction when the compiled worker is not available
  * (running from TypeScript sources, e.g. unit tests) or GMAIL_MCP_EXTRACT_IN_PROCESS=1.
  */
+/** At most this many extractions run at once (env GMAIL_MCP_EXTRACT_CONCURRENCY, default 2). */
+let running = 0;
+const waiting: (() => void)[] = [];
+async function withSlot<T>(fn: () => Promise<T>): Promise<T> {
+  const max = Math.max(1, Number(process.env.GMAIL_MCP_EXTRACT_CONCURRENCY) || 2);
+  if (running >= max) await new Promise<void>((r) => waiting.push(r));
+  running++;
+  try {
+    return await fn();
+  } finally {
+    running--;
+    waiting.shift()?.();
+  }
+}
+
+let warnedInProcess = false;
+
 export async function extractAttachment(data: Uint8Array, filename: string, mimeType: string, opts: ExtractOptions = {}): Promise<ExtractResult> {
   const workerUrl = new URL("./worker.js", import.meta.url);
   if (process.env.GMAIL_MCP_EXTRACT_IN_PROCESS === "1" || !fs.existsSync(fileURLToPath(workerUrl))) {
+    if (!warnedInProcess && process.env.GMAIL_MCP_EXTRACT_IN_PROCESS !== "1" && !process.env.VITEST) {
+      warnedInProcess = true;
+      console.error("[gmail-mcp-multi] attachment worker not found; reading attachments in-process without time/memory limits.");
+    }
     return extractInProcess(data, filename, mimeType, opts);
   }
+  return withSlot(() => extractInWorker(workerUrl, data, filename, mimeType, opts));
+}
+
+async function extractInWorker(workerUrl: URL, data: Uint8Array, filename: string, mimeType: string, opts: ExtractOptions): Promise<ExtractResult> {
   const { timeoutMs, memoryMb } = extractLimits();
   // Copy once into a fresh buffer and transfer that (never transfer the caller's
   // buffer: small Node Buffers share a pooled ArrayBuffer).
@@ -288,14 +313,25 @@ export async function extractAttachment(data: Uint8Array, filename: string, mime
   return new Promise<ExtractResult>((resolve) => {
     let settled = false;
     let timer: NodeJS.Timeout | undefined;
+    let watchdog: NodeJS.Timeout | undefined;
     let worker: Worker;
     const finish = (r: ExtractResult) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (watchdog) clearInterval(watchdog);
       void worker?.terminate().catch(() => undefined);
       resolve(r);
     };
+    // The V8 heap limit doesn't cover ArrayBuffers (where decoders put decompressed data),
+    // so this thread, which stays idle while the worker runs, watches the real process size.
+    const baseRss = process.memoryUsage.rss();
+    const rssBudget = (memoryMb * 2 + 128) * 1024 * 1024; // + room for the worker isolate itself
+    watchdog = setInterval(() => {
+      if (process.memoryUsage.rss() - baseRss > rssBudget) {
+        finish(stopped(filename, `This file is too large to read here (memory limit ${memoryMb} MB). Use save_attachment to open it.`));
+      }
+    }, 100);
     try {
       worker = new Worker(workerUrl, {
         workerData: { data: copy, filename, mimeType, opts },
