@@ -1,15 +1,28 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import fsCjs from "node:fs";
 import * as http from "node:http";
+import { syncBuiltinESMExports } from "node:module";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Worker } from "node:worker_threads";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { AccountManager } from "../src/accounts.js";
 import { AuthStore, AuthStoreError } from "../src/http/auth-store.js";
-import { AttemptQueue, ipKey, ipPrefix48, LoginLimiter, passwordMatches, redirectRuleMatches } from "../src/http/oauth-provider.js";
+import {
+  AttemptQueue,
+  ipKey,
+  ipPrefix48,
+  LoginLimiter,
+  networkKey,
+  passwordMatches,
+  redirectRuleMatches,
+  REGISTRATION_LIMITS,
+  sanitizeClientMetadata,
+} from "../src/http/oauth-provider.js";
 import { buildHttpApp, HttpOptions, parsePublicUrl, RunningHttpServer, startHttpServer } from "../src/http/server.js";
 import { startFakeGmail } from "./fake-gmail.js";
 
@@ -64,6 +77,7 @@ async function start(port?: number, extra: Partial<HttpOptions> = {}, homeDir = 
     accounts: new AccountManager(homeDir),
     disableRateLimits: true,
     attemptMinMs: 10,
+    log: () => undefined,
     ...extra,
   });
 }
@@ -95,13 +109,17 @@ const pkce = () => {
   return { verifier, challenge };
 };
 
-async function register(redirect = CLAUDE_CB, method = "client_secret_post") {
+async function register(redirect = CLAUDE_CB, method = "client_secret_post", ip?: string) {
+  return registerRaw({ client_name: "Claude", redirect_uris: [redirect], token_endpoint_auth_method: method, grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }, ip);
+}
+
+async function registerRaw(body: unknown, ip?: string) {
   const r = await fetch(`${base}/register`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ client_name: "Claude", redirect_uris: [redirect], token_endpoint_auth_method: method, grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }),
+    headers: { "content-type": "application/json", ...(ip ? { "x-forwarded-for": ip } : {}) },
+    body: typeof body === "string" ? body : JSON.stringify(body),
   });
-  return { status: r.status, body: (await r.json()) as { client_id: string; client_secret?: string; error?: string } };
+  return { status: r.status, body: (await r.json()) as Record<string, unknown> & { client_id: string; client_secret?: string; error?: string; error_description?: string } };
 }
 
 async function openLogin(clientId: string, challenge: string, extra: Record<string, string> = {}, ip?: string) {
@@ -698,11 +716,12 @@ describe("sign-out and abuse resistance (HTTP)", () => {
         expect(Date.now() - started).toBeGreaterThanOrEqual(700); // 5 checks x >= 150 ms, never in parallel
         expect(results.map((r) => r.status)).toEqual([401, 401, 401, 401, 302]);
 
-        // Parallel guesses from one address stop at its limit even though all were queued before the first failed.
+        // Parallel guesses from one address: it gets 2 places in the line, the rest are answered "busy" at once
+        // (nothing checked, the forms stay valid).
         const burst = await Promise.all(Array.from({ length: 8 }, () => openLogin(client.client_id, pkce().challenge)));
         const burstResults = await Promise.all(burst.map((pg) => approve(pg, "wrong password!!", "approve", pg.cookie, "192.0.2.77")));
-        expect(burstResults.filter((r) => r.status === 401)).toHaveLength(5);
-        expect(burstResults.filter((r) => r.status === 429)).toHaveLength(3);
+        expect(burstResults.filter((r) => r.status === 401)).toHaveLength(2);
+        expect(burstResults.filter((r) => r.status === 429 && r.text.includes("busy"))).toHaveLength(6);
       });
     } finally {
       await s.close();
@@ -831,5 +850,458 @@ describe("sign-out and abuse resistance (HTTP)", () => {
     for (const ctx of ctxs) expect(ctx.mail).toBe(srv.mail);
     await c1.client.close();
     await c2.client.close();
+  });
+});
+
+const secretsFor = (dir: string) => new AccountManager(dir).secrets;
+const testClient = (id: string) => ({ client_id: id, client_id_issued_at: Math.floor(Date.now() / 1000), redirect_uris: [CLAUDE_CB] }) as never;
+
+/** Replace fs.renameSync (as seen by src/, too) for the duration of fn. */
+function withRenameHook<T>(hook: (from: fs.PathLike, to: fs.PathLike) => void, fn: () => T): T {
+  const real = fsCjs.renameSync;
+  fsCjs.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+    hook(from, to);
+    return real(from, to);
+  }) as typeof fsCjs.renameSync;
+  syncBuiltinESMExports();
+  try {
+    return fn();
+  } finally {
+    fsCjs.renameSync = real;
+    syncBuiltinESMExports();
+  }
+}
+
+describe("client registration limits", () => {
+  it("refuses registration bodies over 8 kB and keeps only the metadata the server uses", async () => {
+    const dir = writeHome();
+    const s = await start(undefined, {}, dir);
+    try {
+      await withServer(s, async () => {
+        const huge = await registerRaw({ client_name: "A".repeat(95_000), redirect_uris: [CLAUDE_CB] });
+        expect(huge.status).toBe(413);
+        expect(huge.body.error).toBe("invalid_client_metadata");
+        expect(storeFor(dir).clientCount()).toBe(0);
+        expect((await registerRaw("{not json")).status).toBe(400);
+
+        const r = await registerRaw({
+          client_name: "  Evil‮App\n" + "x".repeat(300),
+          redirect_uris: [CLAUDE_CB],
+          token_endpoint_auth_method: "client_secret_post",
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+          logo_uri: `https://evil.example/${"l".repeat(1500)}`,
+          contacts: Array.from({ length: 20 }, (_, i) => `a${i}@evil.example`),
+          jwks: { keys: [{ kty: "RSA", n: "n".repeat(1500) }] },
+          software_statement: "s".repeat(800),
+          extra_field: "e".repeat(300),
+        });
+        expect(r.status).toBe(201);
+        expect(String(r.body.client_name)).toHaveLength(REGISTRATION_LIMITS.nameChars);
+        expect(r.body.client_name).toMatch(/^Evil App x+$/); // control and bidi characters replaced
+        for (const k of ["logo_uri", "contacts", "jwks", "software_statement", "extra_field"]) expect(r.body).not.toHaveProperty(k);
+        const stored = storeFor(dir).getClient(r.body.client_id)!;
+        expect(Object.keys(stored).sort()).toEqual([
+          "client_id",
+          "client_id_issued_at",
+          "client_name",
+          "client_secret",
+          "client_secret_expires_at",
+          "grant_types",
+          "redirect_uris",
+          "response_types",
+          "token_endpoint_auth_method",
+        ]);
+        expect((await signIn(r.body)).access_token).toMatch(/^gmm_at_/); // the trimmed client works
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("accepts at most 5 redirect URIs of at most 500 characters, all allowed, and caps the stored size", async () => {
+    const dir = writeHome();
+    const s = await start(undefined, { allowedRedirects: ["https://app.example.com/cb/*"], allowLoopbackRedirects: false }, dir);
+    try {
+      await withServer(s, async () => {
+        const uri = (len: number, tag = "p") => {
+          const prefix = "https://app.example.com/cb/";
+          return prefix + tag.repeat(len - prefix.length);
+        };
+        const reg = (uris: string[], name = "App") => registerRaw({ client_name: name, redirect_uris: uris, token_endpoint_auth_method: "none" });
+        expect((await reg([uri(40, "a"), uri(40, "b"), uri(40, "c"), uri(40, "d"), uri(40, "e")])).status).toBe(201);
+        const six = await reg(Array.from({ length: 6 }, (_, i) => uri(40, String(i))));
+        expect(six.status).toBe(400);
+        expect(six.body.error_description).toMatch(/1 to 5 URIs/);
+        expect((await reg([uri(501)])).status).toBe(400);
+        const foreign = await reg([uri(40), "https://evil.example/cb"]);
+        expect(foreign.status).toBe(400);
+        expect(foreign.body.error_description).toMatch(/not allowed/);
+        // The largest registration accepted stays small, so 500 clients stay around 2 MB.
+        const max = await reg(["a", "b", "c", "d", "e"].map((t) => uri(REGISTRATION_LIMITS.redirectUriChars, t)), "N".repeat(500));
+        expect(max.status).toBe(201);
+        const size = Buffer.byteLength(JSON.stringify(storeFor(dir).getClient(max.body.client_id)));
+        expect(size).toBeLessThanOrEqual(REGISTRATION_LIMITS.storedBytes);
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("sanitizes registration metadata (unit) and groups networks per IPv4 address / IPv6 /48", () => {
+    expect(sanitizeClientMetadata(null)).toHaveProperty("error");
+    expect(sanitizeClientMetadata([CLAUDE_CB])).toHaveProperty("error");
+    expect(sanitizeClientMetadata({ redirect_uris: [] })).toHaveProperty("error");
+    expect(sanitizeClientMetadata({ redirect_uris: [CLAUDE_CB], client_name: 5 })).toHaveProperty("error");
+    expect(sanitizeClientMetadata({ redirect_uris: [CLAUDE_CB], grant_types: Array(6).fill("x") })).toHaveProperty("error");
+    expect(sanitizeClientMetadata({ redirect_uris: [CLAUDE_CB], scope: "s".repeat(300) })).toHaveProperty("error");
+    expect(sanitizeClientMetadata({ redirect_uris: [CLAUDE_CB], client_name: "\u0000⁦ ", logo_uri: "https://x.example" })).toEqual({ metadata: { redirect_uris: [CLAUDE_CB] } });
+    expect(networkKey("2001:db8:1:2::1")).toBe(networkKey("2001:db8:1:ff00:1::9"));
+    expect(networkKey("2001:db8:1:2::1")).not.toBe(networkKey("2001:db8:2:2::1"));
+    expect(networkKey("203.0.113.1")).toBe("203.0.113.1");
+    expect(networkKey("::ffff:203.0.113.1")).toBe("203.0.113.1");
+  });
+
+  it("rate-limits registration per IPv4 address / IPv6 /48, not per /56 or /64", async () => {
+    const s = await start(undefined, { registerRateLimit: { windowMs: 60_000, max: 2 } });
+    try {
+      await withServer(s, async () => {
+        const reg = (ip: string) => register(undefined, undefined, ip);
+        expect((await reg("2001:db8:7:100::1")).status).toBe(201);
+        expect((await reg("2001:db8:7:ff00::1")).status).toBe(201); // another /56 (and /64) of the same /48
+        const third = await reg("2001:db8:7:abcd::9");
+        expect(third.status).toBe(429);
+        expect(third.body.error).toBe("too_many_requests");
+        expect((await reg("2001:db8:8::1")).status).toBe(201); // another /48
+        expect((await reg("203.0.113.50")).status).toBe(201);
+        expect((await reg("203.0.113.50")).status).toBe(201);
+        expect((await reg("203.0.113.50")).status).toBe(429);
+        expect((await reg("203.0.113.51")).status).toBe(201);
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("admits clients per network: each network keeps only a few never-used ones, the network with the most goes first, they expire", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const s = storeFor(writeHome());
+      const o = { maxClients: 6, maxUnusedPerNetwork: 3, unusedGraceMs: 15 * 60_000, unusedTtlMs: 3600_000, inactiveMs: 90 * DAY };
+      const add = (id: string, network: string, keep?: Set<string>) => {
+        vi.setSystemTime(Date.now() + 1000);
+        return s.addClient(testClient(id), { ...o, network, keep });
+      };
+      const ids = () => s.listClients().map((c) => c.client_id).sort();
+      const A = networkKey("2001:db8:a:1::1");
+      expect(add("owner", "198.51.100.1")).toBe(true);
+      // One network (any /64 of a /48): a 4th never-used registration drops that network's oldest, nobody else's.
+      for (const [i, id] of ["a1", "a2", "a3", "a4"].entries()) expect(add(id, networkKey(`2001:db8:a:${i}::1`))).toBe(true);
+      expect(ids()).toEqual(["a2", "a3", "a4", "owner"]);
+      expect(add("b1", "203.0.113.2")).toBe(true);
+      expect(add("b2", "203.0.113.2")).toBe(true);
+      // Full: the network with the most never-used clients loses its oldest, even inside the grace period.
+      expect(add("c1", "203.0.113.3")).toBe(true);
+      expect(ids()).toEqual(["a3", "a4", "b1", "b2", "c1", "owner"]);
+      expect(add("c2", "203.0.113.4")).toBe(true); // A and B both have 2: A's a3 is older
+      expect(add("c3", "203.0.113.5")).toBe(true); // then B
+      expect(ids()).toEqual(["a4", "b2", "c1", "c2", "c3", "owner"]);
+      expect(s.unusedByNetwork().get(A)).toBe(1);
+      // Every network is down to its newest never-used client, all within the grace period: refused, nothing dropped.
+      expect(add("c4", "203.0.113.6")).toBe(false);
+      expect(ids()).toEqual(["a4", "b2", "c1", "c2", "c3", "owner"]);
+      // The owner completes the sign-in: a client that obtained a token is no longer "never used".
+      s.issue({ clientId: "owner", scopes: [], resource: "https://x/mcp" }, { accessMs: 60_000, refreshMs: 60_000 });
+      // After the grace period the oldest never-used client goes.
+      vi.setSystemTime(Date.now() + 16 * 60_000);
+      expect(add("c4", "203.0.113.6")).toBe(true);
+      expect(ids()).toEqual(["b2", "c1", "c2", "c3", "c4", "owner"]);
+      // Never-used clients expire after an hour (unless mid sign-in); used ones don't.
+      vi.setSystemTime(Date.now() + 61 * 60_000);
+      expect(add("d1", "203.0.113.7", new Set(["c3"]))).toBe(true);
+      expect(ids()).toEqual(["c3", "d1", "owner"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("doesn't let one network fill the client slots, or churn push out the owner's fresh client", async () => {
+    const dir = writeHome();
+    const s = await start(undefined, { maxClients: 20 }, dir); // default: 10 never-used per network, 15 min grace
+    try {
+      await withServer(s, async () => {
+        // One /48 registers 40 clients from different /56s and /64s: it keeps only its newest 10.
+        for (let i = 0; i < 40; i++) expect((await register(undefined, undefined, `2001:db8:9:${(i * 256).toString(16)}::1`)).status).toBe(201);
+        expect(storeFor(dir).clientCount()).toBe(10);
+        expect(storeFor(dir).unusedByNetwork().get(networkKey("2001:db8:9::1"))).toBe(10); // the registering network was recorded
+        const { body: owner } = await register(undefined, undefined, "198.51.100.5");
+        const ownerPage = await openLogin(owner.client_id, pkce().challenge, {}, "198.51.100.5");
+        // Churn from many addresses: at the cap the /48's older registrations make room; the owner's fresh
+        // client (its network's newest, in its grace period) is never the one to go.
+        const statuses: number[] = [];
+        for (let i = 0; i < 20; i++) statuses.push((await register(undefined, undefined, `203.0.113.${i + 1}`)).status);
+        expect(statuses.filter((x) => x === 201)).toHaveLength(18);
+        expect(statuses.filter((x) => x === 400)).toHaveLength(2); // every network is down to one fresh client
+        expect(storeFor(dir).clientCount()).toBe(20);
+        expect(storeFor(dir).getClient(owner.client_id)).toBeTruthy();
+        expect((await approve(ownerPage, PASSWORD, "approve", ownerPage.cookie, "198.51.100.5")).status).toBe(302);
+      });
+    } finally {
+      await s.close();
+    }
+  });
+});
+
+describe("sign-in file lock", () => {
+  it("holds off http-logout while a save is between its check and its rename, then applies it in full", () => {
+    const dir = writeHome();
+    const server = new AuthStore(dir, secretsFor(dir), { lockWaitMs: 150 });
+    server.putClient(testClient("attacker"));
+    const stolen = server.issue({ clientId: "attacker", scopes: [], resource: "r" }, { accessMs: 3600_000, refreshMs: DAY });
+    let during: unknown = "not run";
+    // The server rotates a refresh token; http-logout from another process runs while the file is being written.
+    const rotated = withRenameHook(
+      (from) => {
+        if (during !== "not run" || !String(from).endsWith(".tmp")) return;
+        try {
+          during = new AuthStore(dir, secretsFor(dir), { lockWaitMs: 150 }).revokeAll(false);
+        } catch (err) {
+          during = err;
+        }
+      },
+      () => server.takeRefresh(stolen.refresh, 0)
+    );
+    // It could not write in between: it waited for the lock and gave up, changing nothing (the CLI then says to retry;
+    // a real second process simply waits until the server's save is done).
+    expect(during).toBeInstanceOf(AuthStoreError);
+    expect((during as Error).message).toMatch(/being changed by another process/);
+    expect(rotated).toMatchObject({ clientId: "attacker" });
+    const fresh = server.issue({ clientId: "attacker", scopes: [], resource: "r", family: stolen.family }, { accessMs: 3600_000, refreshMs: DAY });
+    expect(new AuthStore(dir, secretsFor(dir)).revokeAll(false).tokens).toBe(3);
+    for (const st of [server, storeFor(dir)]) {
+      expect(st.getAccess(stolen.access)).toBeUndefined();
+      expect(st.getAccess(fresh.access)).toBeUndefined();
+      expect(st.stats()).toMatchObject({ accessTokens: 0, refreshTokens: 0 });
+    }
+    expect(fs.existsSync(server.lockFile)).toBe(false);
+  });
+
+  it("waits for a lock held by another thread/process, then saves", async () => {
+    const dir = writeHome();
+    const store = new AuthStore(dir, secretsFor(dir));
+    store.putClient(testClient("c1"));
+    const worker = new Worker(
+      `const { parentPort, workerData } = require("node:worker_threads");
+       const fs = require("node:fs");
+       fs.writeFileSync(workerData.lock, "another process\\n", { flag: "wx" });
+       setTimeout(() => fs.unlinkSync(workerData.lock), workerData.holdMs);
+       parentPort.postMessage("locked");`,
+      { eval: true, workerData: { lock: store.lockFile, holdMs: 400 } }
+    );
+    try {
+      await new Promise((resolve) => worker.once("message", resolve));
+      const started = Date.now();
+      store.putClient(testClient("c2")); // blocks until the other side lets go
+      const waited = Date.now() - started;
+      expect(waited).toBeGreaterThanOrEqual(250);
+      expect(waited).toBeLessThan(2000);
+    } finally {
+      await worker.terminate();
+    }
+    expect(storeFor(dir).clientCount()).toBe(2);
+    expect(fs.existsSync(store.lockFile)).toBe(false);
+  });
+
+  it("gives up without changes while the lock stays held, and takes over a stale lock", () => {
+    const dir = writeHome();
+    const store = new AuthStore(dir, secretsFor(dir), { lockWaitMs: 100 });
+    store.putClient(testClient("c1"));
+    const t = store.issue({ clientId: "c1", scopes: [], resource: "r" }, { accessMs: 60_000, refreshMs: 60_000 });
+    const before = fs.readFileSync(store.file);
+    fs.writeFileSync(store.lockFile, "4242 live\n");
+    const started = Date.now();
+    expect(() => store.putClient(testClient("c2"))).toThrow(AuthStoreError);
+    expect(() => new AuthStore(dir, secretsFor(dir), { lockWaitMs: 100 }).revokeAll(false)).toThrow(/being changed by another process/);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(180);
+    expect(fs.readFileSync(store.file).equals(before)).toBe(true);
+    expect(fs.readFileSync(store.lockFile, "utf8")).toBe("4242 live\n"); // not ours: left alone
+    expect(store.getClient("c2")).toBeUndefined();
+    expect(store.getAccess(t.access)).toBeTruthy(); // reading needs no lock
+    // A lock left behind by a crashed process (older than 10 s) is taken over.
+    const old = new Date(Date.now() - 20_000);
+    fs.utimesSync(store.lockFile, old, old);
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      store.putClient(testClient("c2"));
+      expect(quiet.mock.calls.flat().join(" ")).toMatch(/stale lock file/);
+    } finally {
+      quiet.mockRestore();
+    }
+    expect(storeFor(dir).clientCount()).toBe(2);
+    expect(fs.existsSync(store.lockFile)).toBe(false);
+  });
+
+  it("never removes a lock that another process took over meanwhile", () => {
+    const dir = writeHome();
+    const store = new AuthStore(dir, secretsFor(dir));
+    withRenameHook(
+      () => fs.writeFileSync(store.lockFile, "5151 took it over\n"), // we were slow; someone decided our lock was stale
+      () => store.putClient(testClient("c1"))
+    );
+    expect(fs.readFileSync(store.lockFile, "utf8")).toBe("5151 took it over\n");
+    fs.unlinkSync(store.lockFile);
+    expect(storeFor(dir).getClient("c1")).toBeTruthy();
+  });
+});
+
+describe("owner sign-in under attack", () => {
+  it("answers requests from a locked network at once, without a place in the line or its minimum time", async () => {
+    const s = await start(undefined, { attemptMinMs: 300, limiter: new LoginLimiter({ maxPerKey: 1 }) });
+    try {
+      await withServer(s, async () => {
+        const { body: client } = await register();
+        const open = () => openLogin(client.client_id, pkce().challenge);
+        // Two parallel guesses from one address: the first locks it; the second, already in line, takes no 300 ms.
+        const [a, b] = [await open(), await open()];
+        const t0 = Date.now();
+        const rs = await Promise.all([a, b].map((pg) => approve(pg, "wrong password!!", "approve", pg.cookie, "203.0.113.20")));
+        expect(rs.map((r) => r.status).sort()).toEqual([401, 429]);
+        expect(Date.now() - t0).toBeLessThan(550); // one check (it was 2 x 300 ms)
+        // Locked: a burst is answered at once and never enters the line.
+        const pages = await Promise.all(Array.from({ length: 15 }, open));
+        const t1 = Date.now();
+        const locked = await Promise.all(pages.map((pg) => approve(pg, PASSWORD, "approve", pg.cookie, "203.0.113.20")));
+        expect(locked.every((r) => r.status === 429 && r.text.includes("Too many wrong passwords"))).toBe(true);
+        expect(Date.now() - t1).toBeLessThan(1500); // 15 x 300 ms if they had queued
+        expect(s.provider.attempts.length).toBe(0);
+        const own = await open();
+        expect((await approve(own, PASSWORD, "approve", own.cookie, "198.51.100.200")).status).toBe(302);
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("gives one address 2 places in the line (and an IPv6 /48 4), so one attacker can't keep the owner out", async () => {
+    const s = await start(undefined, { attemptMinMs: 400, attemptQueueMax: 20 }); // production timings
+    try {
+      await withServer(s, async () => {
+        const { body: atk } = await register();
+        const { body: owner } = await register();
+        const pages = await Promise.all(Array.from({ length: 20 }, () => openLogin(atk.client_id, pkce().challenge)));
+        const ownerPage = await openLogin(owner.client_id, pkce().challenge, {}, "198.51.100.66");
+        const t0 = Date.now();
+        const flood = Promise.all(pages.map((pg, i) => approve(pg, `guess ${i}!!`, "approve", pg.cookie, "203.0.113.66")));
+        await new Promise((r) => setTimeout(r, 50));
+        const r = await approve(ownerPage, PASSWORD, "approve", ownerPage.cookie, "198.51.100.66");
+        expect(r.status).toBe(302); // not "server busy"
+        expect(Date.now() - t0).toBeLessThan(2500);
+        const fr = await flood;
+        expect(fr.filter((x) => x.status === 401)).toHaveLength(2);
+        expect(fr.filter((x) => x.status === 429 && x.text.includes("busy"))).toHaveLength(18);
+
+        // IPv6: 2 places per /64 and 4 per /48.
+        const v6 = await Promise.all(Array.from({ length: 9 }, () => openLogin(atk.client_id, pkce().challenge)));
+        const ips = ["2001:db8:44:1::1", "2001:db8:44:1::2", "2001:db8:44:1::3", "2001:db8:44:2::1", "2001:db8:44:3::1", "2001:db8:44:4::1", "2001:db8:44:5::1", "2001:db8:44:6::1"];
+        const res = await Promise.all(ips.map((ip, i) => approve(v6[i], "wrong password!!", "approve", v6[i].cookie, ip)));
+        expect(res.map((x) => x.status)).toEqual([401, 401, 429, 401, 401, 429, 429, 429]);
+        expect((await approve(v6[8], PASSWORD, "approve", v6[8].cookie, "2001:db8:45::1")).status).toBe(302);
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("doesn't count 'server busy' answers against the per-network limit on the password form", async () => {
+    const s = await start(undefined, { attemptMinMs: 600, attemptQueueMax: 1, approveRateLimit: { windowMs: 60_000, max: 2 } });
+    try {
+      await withServer(s, async () => {
+        const { body: client } = await register();
+        const atk = await openLogin(client.client_id, pkce().challenge);
+        const own = await openLogin(client.client_id, pkce().challenge);
+        const holding = approve(atk, "wrong password!!", "approve", atk.cookie, "203.0.113.90"); // takes the only place
+        await new Promise((r) => setTimeout(r, 100));
+        for (let i = 0; i < 3; i++) {
+          const busy = await approve(own, PASSWORD, "approve", own.cookie, "198.51.100.90");
+          expect(busy.status).toBe(429);
+          expect(busy.text).toContain("busy");
+        }
+        await holding;
+        // The 4th request from this address with a limit of 2: the busy answers were not counted.
+        expect((await approve(own, PASSWORD, "approve", own.cookie, "198.51.100.90")).status).toBe(302);
+        // Real attempts still count.
+        const more = [await openLogin(client.client_id, pkce().challenge), await openLogin(client.client_id, pkce().challenge)];
+        expect((await approve(more[0], "wrong password!!", "approve", more[0].cookie, "198.51.100.90")).status).toBe(401);
+        expect((await approve(more[1], PASSWORD, "approve", more[1].cookie, "198.51.100.90")).status).toBe(429);
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("caps open sign-in requests per network, so no network can push out the owner's", async () => {
+    const s = await start(undefined, { maxPending: 8, maxPendingPerNetwork: 3 });
+    try {
+      await withServer(s, async () => {
+        const { body: client } = await register();
+        const own = await openLogin(client.client_id, pkce().challenge, {}, "198.51.100.7");
+        // One IPv6 /48 opens many requests from different /64s: it keeps only its newest 3.
+        const atk = [];
+        for (let i = 0; i < 12; i++) atk.push(await openLogin(client.client_id, pkce().challenge, {}, `2001:db8:5:${i.toString(16)}::1`));
+        expect(s.provider.pendingCount(networkKey("2001:db8:5::1"))).toBe(3);
+        expect((await approve(atk[0], PASSWORD)).status).toBe(400); // its oldest were dropped
+        expect((await approve(atk[11], PASSWORD)).status).toBe(302);
+        // Many networks: at the server-wide cap, the networks with the most open requests lose their oldest.
+        for (let n = 1; n <= 4; n++) for (let i = 0; i < 3; i++) await openLogin(client.client_id, pkce().challenge, {}, `203.0.113.${n}`);
+        expect(s.provider.pendingCount()).toBe(8);
+        expect(s.provider.pendingCount("198.51.100.7")).toBe(1);
+        expect((await approve(own, PASSWORD, "approve", own.cookie, "198.51.100.7")).status).toBe(302);
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("rate-limits /authorize per IPv6 /48 as well as per /64", async () => {
+    const s = await start(undefined, { authorizeRateLimit: { windowMs: 60_000, max: 3, maxPerPrefix: 5 } });
+    try {
+      await withServer(s, async () => {
+        const { body: client } = await register();
+        const open = (ip: string) => openLogin(client.client_id, pkce().challenge, {}, ip);
+        for (let i = 0; i < 5; i++) expect((await open(`2001:db8:66:${i}::1`)).status).toBe(200);
+        const limited = await open("2001:db8:66:99::1"); // a fresh /64 of the same /48
+        expect(limited.status).toBe(429);
+        expect(Number(limited.retryAfter)).toBeGreaterThan(0);
+        expect((await open("2001:db8:67::1")).status).toBe(200);
+        for (let i = 0; i < 3; i++) expect((await open("192.0.2.9")).status).toBe(200);
+        expect((await open("192.0.2.9")).status).toBe(429);
+        expect((await open("192.0.2.10")).status).toBe(200);
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("logs sign-ins with the client address the server sees", async () => {
+    const lines: string[] = [];
+    const s = await start(undefined, { log: (l) => lines.push(l), limiter: new LoginLimiter({ maxPerKey: 2 }) });
+    try {
+      await withServer(s, async () => {
+        const { body: client } = await register();
+        for (let i = 0; i < 2; i++) {
+          const pg = await openLogin(client.client_id, pkce().challenge);
+          expect((await approve(pg, "wrong password!!", "approve", pg.cookie, "203.0.113.30")).status).toBe(401);
+        }
+        const pg = await openLogin(client.client_id, pkce().challenge);
+        expect((await approve(pg, PASSWORD, "approve", pg.cookie, "2001:db8:31:1::5")).status).toBe(302);
+        expect(lines).toEqual([
+          "sign-in: wrong password from 203.0.113.30",
+          "sign-in: wrong password from 203.0.113.30; 203.0.113.30 is locked for 5 min",
+          'sign-in: approved from 2001:db8:31:1::5 for client "Claude"',
+        ]);
+      });
+    } finally {
+      await s.close();
+    }
   });
 });
