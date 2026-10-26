@@ -7,6 +7,8 @@ import type { AddressInfo } from "node:net";
  */
 
 const b64u = (s: string | Buffer) => Buffer.from(s).toString("base64url");
+/** Fixture timestamps are relative to "now" so time-window features stay testable. */
+const ago = (hours: number) => String(Date.now() - hours * 3_600_000);
 
 interface Msg {
   id: string;
@@ -24,6 +26,8 @@ export interface Mailbox {
   drafts: { id: string; message: { id: string; threadId: string; raw?: string } }[];
   sendAs: { sendAsEmail: string; displayName?: string; isDefault?: boolean; signature?: string }[];
   attachments: Record<string, string>;
+  sent: { raw: string; threadId?: string }[];
+  calendar?: { calendars: Record<string, unknown>[]; events: Record<string, Record<string, unknown>[]> };
 }
 
 const hdrs = (o: Record<string, string>) => Object.entries(o).map(([name, value]) => ({ name, value }));
@@ -39,12 +43,20 @@ export function fixtures(): Record<string, Mailbox> {
       ],
       sendAs: [{ sendAsEmail: "urbanstickersgr@gmail.com", displayName: "UrbanStickers", isDefault: true, signature: "<b>UrbanStickers</b><br>urbanstickers.gr" }],
       drafts: [],
+      sent: [],
       attachments: { "att-1": b64u("%PDF-1.4 fake invoice") },
+      calendar: {
+        calendars: [
+          { id: "primary", summary: "urbanstickersgr@gmail.com", primary: true, selected: true, accessRole: "owner" },
+          { id: "holidays", summary: "Αργίες", selected: false, accessRole: "reader" },
+        ],
+        events: { primary: [], holidays: [] },
+      },
       messages: [
         {
           id: "u1",
           threadId: "tu1",
-          internalDate: String(Date.UTC(2026, 9, 25, 9, 0)),
+          internalDate: ago(1),
           labelIds: ["INBOX", "UNREAD", "Label_1"],
           snippet: "Καλημέρα, θα ήθελα προσφορά για βιτρίνα",
           payload: {
@@ -76,10 +88,57 @@ export function fixtures(): Record<string, Mailbox> {
         {
           id: "u2",
           threadId: "tu2",
-          internalDate: String(Date.UTC(2026, 9, 20, 9, 0)),
+          internalDate: ago(24 * 6),
           labelIds: ["INBOX"],
           snippet: "Your order shipped",
           payload: { mimeType: "text/plain", headers: hdrs({ From: "shop@example.com", To: "urbanstickersgr@gmail.com", Subject: "Order shipped" }), body: { data: b64u("Shipped!") } },
+        },
+        {
+          id: "n1",
+          threadId: "tn1",
+          internalDate: ago(3),
+          labelIds: ["INBOX", "UNREAD", "CATEGORY_PROMOTIONS"],
+          snippet: "Νέες προσφορές! unsubscribe",
+          payload: {
+            mimeType: "text/plain",
+            headers: hdrs({
+              From: "Shop News <news@shop.example>",
+              To: "urbanstickersgr@gmail.com",
+              Subject: "Προσφορές εβδομάδας",
+              "List-Unsubscribe": "<mailto:unsub@shop.example?subject=unsubscribe-me>, <https://shop.example/u/123>",
+              "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+              "Message-ID": "<n1@shop.example>",
+            }),
+            body: { data: b64u("Offers. unsubscribe") },
+          },
+        },
+        {
+          id: "n2",
+          threadId: "tn2",
+          internalDate: ago(50),
+          labelIds: ["INBOX", "CATEGORY_PROMOTIONS"],
+          snippet: "Last week offers unsubscribe",
+          payload: {
+            mimeType: "text/plain",
+            headers: hdrs({ From: "Shop News <news@shop.example>", To: "urbanstickersgr@gmail.com", Subject: "Offers", "List-Unsubscribe": "<mailto:unsub@shop.example>" }),
+            body: { data: b64u("Offers. unsubscribe") },
+          },
+        },
+        {
+          id: "r1a",
+          threadId: "tr1",
+          internalDate: ago(72),
+          labelIds: ["INBOX"],
+          snippet: "Where is order 55?",
+          payload: { mimeType: "text/plain", headers: hdrs({ From: "Client Bob <bob@client.example>", To: "urbanstickersgr@gmail.com", Subject: "Order 55" }), body: { data: b64u("Where is order 55?") } },
+        },
+        {
+          id: "r1b",
+          threadId: "tr1",
+          internalDate: ago(70),
+          labelIds: ["SENT"],
+          snippet: "Shipped today",
+          payload: { mimeType: "text/plain", headers: hdrs({ From: "UrbanStickers <urbanstickersgr@gmail.com>", To: "bob@client.example", Subject: "Re: Order 55" }), body: { data: b64u("Shipped today") } },
         },
       ],
     },
@@ -88,12 +147,13 @@ export function fixtures(): Record<string, Mailbox> {
       labels: [{ id: "INBOX", name: "INBOX", type: "system" }],
       sendAs: [{ sendAsEmail: "antony@psdgator.com", isDefault: true }],
       drafts: [],
+      sent: [],
       attachments: {},
       messages: [
         {
           id: "p1",
           threadId: "tp1",
-          internalDate: String(Date.UTC(2026, 9, 24, 12, 0)),
+          internalDate: ago(30),
           labelIds: ["INBOX", "UNREAD"],
           snippet: "Invoice &amp; contract",
           payload: { mimeType: "text/plain", headers: hdrs({ From: "client@example.com", To: "antony@psdgator.com", Subject: "Invoice" }), body: { data: b64u("Please find the invoice.") } },
@@ -103,16 +163,82 @@ export function fixtures(): Record<string, Mailbox> {
   };
 }
 
+/** Gmail matches names regardless of case and accents. */
+const fold = (x: string) => x.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
+
+function hdr(m: Msg, name: string): string {
+  const hs = (m.payload.headers as { name: string; value: string }[] | undefined) ?? [];
+  return hs.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value ?? "";
+}
+
+/** Enough of Gmail's query language for the tests; unknown operators/groups are ignored. */
 function matches(m: Msg, q: string): boolean {
-  const query = q.trim().toLowerCase();
+  const query = q.replace(/\([^)]*\)/g, " ").trim();
   if (!query) return true;
-  return query.split(/\s+/).every((t) => {
-    if (t === "is:unread") return m.labelIds.includes("UNREAD");
-    if (t === "in:inbox") return m.labelIds.includes("INBOX");
-    if (t === "has:attachment") return JSON.stringify(m.payload).includes("attachmentId");
-    const text = JSON.stringify(m).toLowerCase();
-    return text.includes(t.replace(/^(from|subject):/, ""));
+  const tokens = query.match(/-?[a-z_]+:"[^"]*"|-?[a-z_]+:\S+|"[^"]*"|\S+/gi) ?? [];
+  return tokens.every((raw) => {
+    const neg = raw.startsWith("-");
+    const t = (neg ? raw.slice(1) : raw).replace(/"/g, "");
+    const lower = t.toLowerCase();
+    let r: boolean;
+    if (lower === "is:unread") r = m.labelIds.includes("UNREAD");
+    else if (lower === "is:starred") r = m.labelIds.includes("STARRED");
+    else if (lower === "in:inbox") r = m.labelIds.includes("INBOX");
+    else if (lower === "in:sent") r = m.labelIds.includes("SENT");
+    else if (lower === "in:drafts") r = m.labelIds.includes("DRAFT");
+    else if (lower === "has:attachment") r = JSON.stringify(m.payload).includes("attachmentId");
+    else if (lower.startsWith("from:")) r = fold(hdr(m, "From")).includes(fold(t.slice(5)));
+    else if (lower.startsWith("to:")) r = fold(`${hdr(m, "To")} ${hdr(m, "Cc")}`).includes(fold(t.slice(3)));
+    else if (lower.startsWith("category:")) r = m.labelIds.includes(`CATEGORY_${t.slice(9).toUpperCase()}`);
+    else if (lower.startsWith("subject:")) r = hdr(m, "Subject").toLowerCase().includes(t.slice(8).toLowerCase());
+    else if (lower.startsWith("newer_than:")) {
+      const n = Number(lower.match(/(\d+)/)?.[1] ?? 0);
+      r = Date.now() - Number(m.internalDate) <= n * 86_400_000;
+    } else if (lower.startsWith("older_than:")) {
+      const n = Number(lower.match(/(\d+)/)?.[1] ?? 0);
+      r = Date.now() - Number(m.internalDate) > n * 86_400_000;
+    } else if (/^[a-z_]+:/.test(lower)) return true; // operator the fake doesn't model: ignore (even when negated)
+    else r = JSON.stringify(m).toLowerCase().includes(lower);
+    return neg ? !r : r;
   });
+}
+
+function calendarRoute(box: Mailbox, method: string, url: URL, bodyText: string, send: (s: number, o: unknown) => void) {
+  const cal = box.calendar;
+  if (!cal) return send(403, { error: { code: 403, message: "Request had insufficient authentication scopes." } });
+  const p = url.pathname.replace(/^\/calendar\/v3/, "");
+  let mm: RegExpMatchArray | null;
+  if (p === "/users/me/calendarList") return send(200, { items: cal.calendars });
+  if ((mm = p.match(/^\/calendars\/([^/]+)\/events$/))) {
+    const id = decodeURIComponent(mm[1]);
+    cal.events[id] ??= [];
+    if (method === "POST") {
+      const ev = { id: `ev${cal.events[id].length + 1}`, status: "confirmed", htmlLink: `https://calendar.example/${id}`, ...JSON.parse(bodyText) };
+      cal.events[id].push(ev);
+      return send(200, ev);
+    }
+    const min = Date.parse(url.searchParams.get("timeMin") ?? "1970-01-01");
+    const max = Date.parse(url.searchParams.get("timeMax") ?? "2999-01-01");
+    const q = (url.searchParams.get("q") ?? "").toLowerCase();
+    const items = cal.events[id].filter((e) => {
+      const st = Date.parse(((e.start as { dateTime?: string; date?: string }).dateTime ?? (e.start as { date: string }).date) as string);
+      return st >= min && st < max && (!q || JSON.stringify(e).toLowerCase().includes(q));
+    });
+    return send(200, { items });
+  }
+  if (p === "/freeBusy" && method === "POST") {
+    const b = JSON.parse(bodyText);
+    const calendars: Record<string, { busy: { start: string; end: string }[] }> = {};
+    for (const it of b.items as { id: string }[]) {
+      calendars[it.id] = {
+        busy: (cal.events[it.id] ?? [])
+          .filter((e) => (e.start as { dateTime?: string }).dateTime)
+          .map((e) => ({ start: (e.start as { dateTime: string }).dateTime, end: (e.end as { dateTime: string }).dateTime })),
+      };
+    }
+    return send(200, { calendars });
+  }
+  return send(404, { error: { code: 404, message: `fake calendar: no route ${method} ${p}` } });
 }
 
 export interface FakeGmail {
@@ -152,6 +278,7 @@ export async function startFakeGmail(): Promise<FakeGmail> {
     const box = boxes[token];
     if (!box) return send(401, { error: { code: 401, message: "Invalid Credentials" } });
 
+    if (url.pathname.startsWith("/calendar/v3/")) return calendarRoute(box, req.method ?? "GET", url, bodyText, send);
     const p = url.pathname.replace(/^\/gmail\/v1\/users\/me/, "");
     const find = (id: string) => box.messages.find((m) => m.id === id);
     let mm: RegExpMatchArray | null;
@@ -160,8 +287,17 @@ export async function startFakeGmail(): Promise<FakeGmail> {
     if (p === "/messages" && req.method === "GET") {
       const q = url.searchParams.get("q") ?? "";
       const max = Number(url.searchParams.get("maxResults") ?? 100);
-      const found = box.messages.filter((m) => matches(m, q)).slice(0, max);
+      const found = box.messages
+        .filter((m) => matches(m, q))
+        .filter((m) => url.searchParams.get("includeSpamTrash") === "true" || !m.labelIds.includes("TRASH"))
+        .sort((a, b) => Number(b.internalDate) - Number(a.internalDate))
+        .slice(0, max);
       return send(200, { messages: found.map((m) => ({ id: m.id, threadId: m.threadId })), resultSizeEstimate: found.length });
+    }
+    if (p === "/messages/send" && req.method === "POST") {
+      const b = JSON.parse(bodyText);
+      box.sent.push({ raw: b.raw, threadId: b.threadId });
+      return send(200, { id: `s${seq++}`, threadId: b.threadId ?? `st${seq}`, labelIds: ["SENT"] });
     }
     if (p === "/messages/batchModify" && req.method === "POST") {
       const b = JSON.parse(bodyText);
@@ -184,7 +320,7 @@ export async function startFakeGmail(): Promise<FakeGmail> {
       return send(200, m);
     }
     if ((mm = p.match(/^\/threads\/([^/]+)$/))) {
-      const msgs = box.messages.filter((m) => m.threadId === mm![1]);
+      const msgs = box.messages.filter((m) => m.threadId === mm![1]).sort((a, b) => Number(a.internalDate) - Number(b.internalDate));
       return msgs.length ? send(200, { id: mm[1], messages: msgs }) : send(404, { error: { code: 404, message: "Not Found" } });
     }
     if (p === "/labels" && req.method === "GET") return send(200, { labels: box.labels });
@@ -206,7 +342,18 @@ export async function startFakeGmail(): Promise<FakeGmail> {
       const d = box.drafts.find((x) => x.id === mm![1]);
       return d ? send(200, { id: d.id, message: { id: d.message.id, threadId: d.message.threadId, payload: { headers: [] } } }) : send(404, {});
     }
-    if (p.startsWith("/messages/send")) return send(500, { error: { code: 500, message: "SEND MUST NEVER BE CALLED IN THIS TEST" } });
+    if ((mm = p.match(/^\/messages\/([^/]+)\/trash$/)) && req.method === "POST") {
+      const m = find(mm[1]);
+      if (!m) return send(404, { error: { code: 404, message: "Not Found" } });
+      m.labelIds = [...m.labelIds.filter((l) => l !== "INBOX"), "TRASH"];
+      return send(200, { id: m.id, labelIds: m.labelIds });
+    }
+    if (p === "/threads" && req.method === "GET") {
+      const q = url.searchParams.get("q") ?? "";
+      const max = Number(url.searchParams.get("maxResults") ?? 100);
+      const ids = [...new Set(box.messages.filter((m) => matches(m, q)).sort((a, b) => Number(b.internalDate) - Number(a.internalDate)).map((m) => m.threadId))].slice(0, max);
+      return send(200, { threads: ids.map((id) => ({ id })), resultSizeEstimate: ids.length });
+    }
     return send(404, { error: { code: 404, message: `fake gmail: no route ${req.method} ${p}` } });
   });
 

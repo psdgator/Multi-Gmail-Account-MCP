@@ -4,8 +4,11 @@ import { AuditLog } from "./audit.js";
 import type { Mode } from "./config.js";
 import { MailRegistry } from "./providers/registry.js";
 import { registerAccountTools } from "./tools/accounts.js";
+import { registerCalendarTools } from "./tools/calendar.js";
+import { registerCleanupTools } from "./tools/cleanup.js";
 import type { ToolContext } from "./tools/common.js";
 import { registerComposeTools } from "./tools/compose.js";
+import { registerDigestTools } from "./tools/digest.js";
 import { registerOrganizeTools } from "./tools/organize.js";
 import { registerReadTools } from "./tools/read.js";
 import { VERSION } from "./version.js";
@@ -16,6 +19,9 @@ export const toolGroups: ((server: McpServer, ctx: ToolContext) => void)[] = [
   registerReadTools,
   registerComposeTools,
   registerOrganizeTools,
+  registerDigestTools,
+  registerCleanupTools,
+  registerCalendarTools,
 ];
 
 function instructions(ctx: ToolContext): string {

@@ -22,7 +22,7 @@ export interface AuditEntry {
   via?: string;
 }
 
-const DROP = new Set(["body", "html", "password", "content", "data", "signature"]);
+const DROP = new Set(["body", "html", "note", "password", "content", "data", "signature", "text"]);
 const MAX_ROTATE_BYTES = 5 * 1024 * 1024;
 
 /** Keep what identifies an action, drop content and secrets, cap sizes. */

@@ -45,6 +45,7 @@
     "url": "https://github.com/psdgator/Multi-Gmail-Account-MCP.git"
   },
   "dependencies": {
+    "@googleapis/calendar": "^20.1.0",
     "@googleapis/gmail": "^22.0.2",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "html-to-text": "^10.0.1",

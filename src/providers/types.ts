@@ -31,6 +31,9 @@ export interface OriginalHeaders {
   rfcMessageId?: string;
   references?: string;
   threadId?: string;
+  /** RFC 2369 / 8058 unsubscribe headers, when present. */
+  listUnsubscribe?: string;
+  listUnsubscribePost?: string;
 }
 
 export interface SearchOptions {
@@ -40,6 +43,8 @@ export interface SearchOptions {
   includeSpamTrash?: boolean;
   /** Extra headers to return in `CleanMessage.headers` (e.g. "List-Unsubscribe"). */
   headers?: string[];
+  /** Only ids are needed (bulk actions): providers may skip fetching headers. */
+  idsOnly?: boolean;
 }
 
 export interface SearchResult {

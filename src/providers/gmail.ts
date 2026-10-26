@@ -185,6 +185,14 @@ export class GmailProvider implements MailProvider {
       ...(o.pageToken ? { pageToken: o.pageToken } : {}),
     });
     const ids = (res.data.messages ?? []).map((m) => m.id!).filter(Boolean);
+    if (o.idsOnly) {
+      const threadOf = new Map((res.data.messages ?? []).map((m) => [m.id!, m.threadId ?? ""]));
+      return {
+        messages: ids.map((id) => ({ account: this.account.alias, id, threadId: threadOf.get(id) ?? "", date: "", from: "", to: "", subject: "", labels: [], unread: false, starred: false })),
+        next: res.data.nextPageToken ?? undefined,
+        estimate: res.data.resultSizeEstimate ?? 0,
+      };
+    }
     return {
       messages: await this.meta(ids, o.headers),
       next: res.data.nextPageToken ?? undefined,
@@ -214,7 +222,7 @@ export class GmailProvider implements MailProvider {
       userId: "me",
       id,
       format: "metadata",
-      metadataHeaders: ["From", "To", "Cc", "Reply-To", "Subject", "Date", "Message-ID", "Message-Id", "References"],
+      metadataHeaders: ["From", "To", "Cc", "Reply-To", "Subject", "Date", "Message-ID", "Message-Id", "References", "List-Unsubscribe", "List-Unsubscribe-Post"],
     });
     const h = orig.data.payload?.headers ?? undefined;
     return {
@@ -227,6 +235,8 @@ export class GmailProvider implements MailProvider {
       rfcMessageId: header(h, "Message-ID") ?? header(h, "Message-Id"),
       references: header(h, "References"),
       threadId: orig.data.threadId ?? undefined,
+      listUnsubscribe: header(h, "List-Unsubscribe"),
+      listUnsubscribePost: header(h, "List-Unsubscribe-Post"),
     };
   }
 

@@ -140,7 +140,7 @@ describe("retries", () => {
 
     fake.faults.set("GET /messages", 2);
     const r = await p.search({ query: "", max: 5 });
-    expect(r.messages.length).toBe(2);
+    expect(r.messages.length).toBe(5);
     expect(fake.faults.get("GET /messages")).toBe(0);
 
     fake.faults.set("POST /messages/send", 1);

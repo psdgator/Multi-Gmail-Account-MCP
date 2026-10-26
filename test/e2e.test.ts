@@ -101,16 +101,17 @@ describe("multi-account behaviour (drafts mode)", () => {
   it("searches every account at once, newest first, tagged by account", async () => {
     const r = await call(client, "search_emails", { query: "is:unread" });
     expect(r.searched.map((s: { account: string }) => s.account)).toEqual(["urbanstickers", "psdgator"]);
-    expect(r.results.map((m: { account: string; id: string }) => `${m.account}:${m.id}`)).toEqual(["urbanstickers:u1", "psdgator:p1"]);
+    expect(r.results.map((m: { account: string; id: string }) => `${m.account}:${m.id}`)).toEqual(["urbanstickers:u1", "urbanstickers:n1", "psdgator:p1"]);
     expect(r.results[0].labels).toContain("Πελάτες");
-    expect(r.results[1].snippet).toBe("Invoice & contract");
+    expect(r.results[2].snippet).toBe("Invoice & contract");
   });
 
   it("searches a single account by alias or email", async () => {
     const a = await call(client, "search_emails", { query: "", account: "psdgator" });
     expect(a.results.map((m: { id: string }) => m.id)).toEqual(["p1"]);
-    const b = await call(client, "search_emails", { query: "", account: ["urbanstickersgr@gmail.com"] });
-    expect(b.results.map((m: { id: string }) => m.id)).toEqual(["u1", "u2"]);
+    const b = await call(client, "search_emails", { query: "in:inbox", account: ["urbanstickersgr@gmail.com"] });
+    expect(b.results.every((m: { account: string }) => m.account === "urbanstickers")).toBe(true);
+    expect(b.results.map((m: { id: string }) => m.id)).toEqual(["u1", "n1", "n2", "r1a", "u2"]);
   });
 
   it("reports a broken account without failing the others", async () => {
@@ -129,9 +130,9 @@ describe("multi-account behaviour (drafts mode)", () => {
 
   it("summarizes all inboxes", async () => {
     const r = await call(client, "inbox_summary");
-    expect(r.totalUnread).toBe(2);
+    expect(r.totalUnread).toBe(3);
     expect(r.accounts.map((a: { account: string; inboxUnread: number }) => [a.account, a.inboxUnread])).toEqual([
-      ["urbanstickers", 1],
+      ["urbanstickers", 2],
       ["psdgator", 1],
     ]);
   });
