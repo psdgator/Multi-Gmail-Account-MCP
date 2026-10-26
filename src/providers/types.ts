@@ -51,6 +51,11 @@ export interface SearchResult {
   messages: CleanMessage[];
   next?: string;
   estimate?: number;
+  /**
+   * Parts of the query this provider could not apply (e.g. Gmail-only operators on IMAP).
+   * When non-empty, the results may be BROADER than requested; bulk actions must refuse.
+   */
+  ignored?: string[];
 }
 
 export interface InboxStatus {
