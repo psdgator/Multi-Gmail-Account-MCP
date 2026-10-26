@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.psdgator/multi-gmail-account-mcp",
   "title": "Multi Gmail Account MCP",
-  "description": "Many Gmail and IMAP accounts at once: unified search, needs-reply, digest, attachments, Calendar, drafts-only by default.",
+  "description": "Many Gmail and IMAP accounts at once: unified search, triage, attachments, Calendar. Drafts-only.",
   "repository": {
     "url": "https://github.com/psdgator/Multi-Gmail-Account-MCP",
     "source": "github"
@@ -22,7 +22,11 @@
           "name": "--mode",
           "description": "readonly, drafts (default: never sends) or full",
           "default": "drafts",
-          "choices": ["readonly", "drafts", "full"]
+          "choices": [
+            "readonly",
+            "drafts",
+            "full"
+          ]
         }
       ],
       "environmentVariables": [

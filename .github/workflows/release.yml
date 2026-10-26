@@ -29,6 +29,8 @@ jobs:
           test "$(node -p "require('./package.json').version")" = "$TAG"
           test "$(node -p "require('./server.json').version")" = "$TAG"
           test "$(node -p "require('./server.json').packages[0].version")" = "$TAG"
+          # The MCP Registry rejects descriptions over 100 characters.
+          test "$(node -p "require('./server.json').description.length")" -le 100
       - run: npm ci
       - run: npm test
 
