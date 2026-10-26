@@ -85,9 +85,10 @@ export function rootId(h: { references?: string; inReplyTo?: string; messageId?:
   return msgIds(h.references)[0] ?? msgIds(h.inReplyTo)[0] ?? msgIds(h.messageId)[0];
 }
 
+/** Envelope addresses as "Name <addr>" text. Group markers (undisclosed-recipients:;) have no address and are skipped. */
 function fmtAddrs(list: MessageAddressObject[] | undefined): string {
   return (list ?? [])
-    .filter((a) => a.address || a.name)
+    .filter((a) => typeof a.address === "string" && a.address.includes("@") && !/[\s;:<>]/.test(a.address))
     .map((a) => (a.name ? `${/[",<>@]/.test(a.name) ? `"${a.name.replace(/"/g, "'")}"` : a.name} <${a.address ?? ""}>` : a.address ?? ""))
     .join(", ");
 }
@@ -285,6 +286,31 @@ export class ImapProvider implements MailProvider {
     const r = await c.mailboxCreate(name);
     this.folderCache = undefined;
     return r.path;
+  }
+
+  /**
+   * Folders that labels must never move or copy mail into or out of: Trash, Junk/Spam,
+   * Drafts, Sent and All Mail (by special-use flag or by name in several languages).
+   * Returns the role, or undefined for an ordinary folder.
+   */
+  private protectedRole(f: Folder): "trash" | "junk" | "drafts" | "sent" | "all" | undefined {
+    for (const role of ["trash", "junk", "drafts", "sent", "all"] as const) {
+      if (f.specialUse === ROLE_SPECIAL[role] || ROLE_NAMES[role].test(f.name) || ROLE_NAMES[role].test(f.path)) return role;
+    }
+    return undefined;
+  }
+
+  private refuseProtected(f: Folder, verb: "add" | "remove"): void {
+    const role = this.protectedRole(f);
+    if (!role) return;
+    const why = {
+      trash: verb === "add" ? 'Moving mail to Trash is not done with labels; use trash_emails (full mode).' : "Restore it with moveToInbox instead.",
+      junk: "Marking or unmarking spam is not supported.",
+      drafts: "The Drafts folder is managed with create_draft / delete_draft.",
+      sent: "The Sent folder can't be changed with labels.",
+      all: "The All Mail folder can't be changed with labels.",
+    }[role];
+    throw new Error(`"${f.path}" is the ${role} folder of "${this.account.alias}"; it can't be ${verb === "add" ? "added as a label" : "removed as a label"}. ${why}`);
   }
 
   /** Resolve a user-given folder/label name (case-insensitive path or leaf name; "/" works as separator). */
@@ -497,6 +523,7 @@ export class ImapProvider implements MailProvider {
             )) {
               if (q.hasAttachment !== undefined && hasAttachment(m.bodyStructure) !== q.hasAttachment) continue;
               if (q.notBefore && toDate(m.internalDate) < q.notBefore) continue;
+              if (q.notAfter && toDate(m.internalDate) >= q.notAfter) continue;
               found.push(this.summary(path, m, extra));
             }
             found.sort((a, b) => (a.date < b.date ? 1 : -1));
@@ -510,7 +537,12 @@ export class ImapProvider implements MailProvider {
     const merged = perBox.flat().sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
     const page = merged.slice(offset, offset + o.max);
     const more = merged.length > offset + o.max || estimate > offset + o.max;
-    return { messages: page, next: more && page.length ? String(offset + o.max) : undefined, estimate };
+    return {
+      messages: page,
+      next: more && page.length ? String(offset + o.max) : undefined,
+      estimate,
+      ...(q.ignored.length ? { ignored: [...q.ignored] } : {}),
+    };
   }
 
   async inboxStatus(): Promise<InboxStatus> {
@@ -645,12 +677,14 @@ export class ImapProvider implements MailProvider {
     for (const name of c.addLabels ?? []) {
       const f = await this.findFolder(name);
       if (!f) throw new Error(`Folder "${name}" does not exist in ${this.account.alias}. Use list_labels, or create_label first.`);
+      this.refuseProtected(f, "add");
       addFolders.push(f.path);
     }
     const removeFolders: string[] = [];
     for (const name of c.removeLabels ?? []) {
       const f = await this.findFolder(name);
       if (!f) throw new Error(`Folder "${name}" does not exist in ${this.account.alias}.`);
+      this.refuseProtected(f, "remove");
       removeFolders.push(f.path);
     }
     const archive = c.archive ? await this.roleFolder("archive", true) : undefined;
@@ -724,10 +758,30 @@ export class ImapProvider implements MailProvider {
     return r.messages.map((m) => ({ draftId: m.id, messageId: m.id, threadId: m.threadId, to: m.to, subject: m.subject, date: m.date }));
   }
 
-  async deleteDraft(draftId: string): Promise<void> {
+  /**
+   * A draft = a message in the Drafts folder carrying the \Draft flag. Anything else is
+   * refused, so delete_draft / send_draft can never touch received or sent mail.
+   */
+  private async requireDraft(draftId: string): Promise<{ path: string; uid: number; drafts: string }> {
     const { path, uid } = this.parseIdOrThrow(draftId);
     const drafts = await this.roleFolder("drafts");
-    if (drafts && path !== drafts) throw new Error(`${draftId} is not in the Drafts folder of "${this.account.alias}".`);
+    if (!drafts) throw new Error(`"${this.account.alias}" has no Drafts folder, so ${draftId} is not a draft. Refusing.`);
+    if (path !== drafts) throw new Error(`${draftId} is not in the Drafts folder (${drafts}) of "${this.account.alias}". Refusing.`);
+    const flags = await this.withBox(
+      path,
+      async (c) => {
+        const m = await c.fetchOne(String(uid), { uid: true, flags: true }, { uid: true });
+        if (!m) throw new Error(`Not found in "${this.account.alias}" (draft ${draftId}).`);
+        return m.flags ?? new Set<string>();
+      },
+      true
+    );
+    if (!flags.has("\\Draft")) throw new Error(`${draftId} in ${drafts} is not marked as a draft (no \\Draft flag). Refusing.`);
+    return { path, uid, drafts };
+  }
+
+  async deleteDraft(draftId: string): Promise<void> {
+    const { path, uid } = await this.requireDraft(draftId);
     await this.withBox(path, async (c) => {
       const ok = await c.messageDelete(String(uid), { uid: true });
       if (!ok) throw new Error(`Not found in "${this.account.alias}" (draft ${draftId}).`);
@@ -775,10 +829,19 @@ export class ImapProvider implements MailProvider {
     return { messageId: sentId, threadId };
   }
 
-  async sendDraft(draftId: string): Promise<{ messageId?: string; threadId?: string }> {
+  async sendDraft(draftId: string): Promise<{ messageId?: string; threadId?: string; warning?: string }> {
+    const { drafts } = await this.requireDraft(draftId); // checked BEFORE anything is sent
     const m = await this.fetchSource(draftId);
     const r = await this.send(m.source.toString("utf8"));
-    await this.deleteDraft(draftId);
+    // Sent. From here on never throw: a retry would send the email twice.
+    try {
+      await this.deleteDraft(draftId);
+    } catch (err) {
+      return {
+        ...r,
+        warning: `The email WAS sent, but the draft could not be removed from ${drafts} (${(err as Error).message}). Delete it by hand; do not send it again.`,
+      };
+    }
     return r;
   }
 

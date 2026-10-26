@@ -143,6 +143,51 @@ export function imapStorage(now = Date.now()) {
   };
 }
 
+/** IMAP modified UTF-7 (RFC 3501 §5.1.3), the on-the-wire form of non-ASCII folder names. */
+function mutf7(name: string): string {
+  return name.replace(/[^\x20-\x7e]+/g, (run) => {
+    const be = Buffer.from(run, "utf16le").swap16();
+    return `&${be.toString("base64").replace(/=+$/, "").replace(/\//g, ",")}-`;
+  });
+}
+
+/**
+ * A bare mailbox: no Drafts/Trash/Junk special-use folders, a folder named "Spam" and one
+ * named "Κάδος" (Greek "Trash") without flags, and mail addressed with group syntax.
+ */
+export function minimalStorage(now = Date.now()) {
+  const d = (hoursAgo: number) => new Date(now - hoursAgo * H);
+  const bin = (s: string) => Buffer.from(s, "utf8").toString("binary");
+  const group = [
+    "From: Dimitris <dim@x.example>",
+    "To: undisclosed-recipients:;",
+    "Cc: Team: a@team.example, Bee <b@team.example>;",
+    "Subject: Group mail",
+    "Message-ID: <g1@x.example>",
+    `Date: ${d(3).toUTCString()}`,
+    "",
+    "hello all",
+  ].join(CRLF);
+  const plain = [
+    "From: Eve <eve@y.example>",
+    "To: antony@psdgator.com",
+    "Subject: Plain mail",
+    "Message-ID: <p1@y.example>",
+    `Date: ${d(2).toUTCString()}`,
+    "",
+    "hi",
+  ].join(CRLF);
+  return {
+    INBOX: {
+      messages: [
+        { raw: bin(group), flags: [], internaldate: d(3) },
+        { raw: bin(plain), flags: [], internaldate: d(2) },
+      ],
+    },
+    "": { separator: "/", folders: { Clients: {}, Spam: {}, [mutf7("Κάδος")]: {} } },
+  };
+}
+
 export interface FakeMailServers {
   imapPort: number;
   smtpPort: number;
@@ -150,10 +195,10 @@ export interface FakeMailServers {
   close(): Promise<void>;
 }
 
-export async function startFakeMailServers(): Promise<FakeMailServers> {
+export async function startFakeMailServers(opts: { storage?: Record<string, unknown> } = {}): Promise<FakeMailServers> {
   const imap = hoodiecrow({
     plugins: ["ID", "ENABLE", "IDLE", "SPECIAL-USE", "UIDPLUS", "MOVE", "UNSELECT", "LITERALPLUS", "ESEARCH", "NAMESPACE", "CREATE-SPECIAL-USE"],
-    storage: imapStorage(),
+    storage: opts.storage ?? imapStorage(),
   });
   await new Promise<void>((r) => imap.listen(0, "127.0.0.1", r));
   const imapPort = (imap.server ? imap.server.address() : imap.address!()).port;

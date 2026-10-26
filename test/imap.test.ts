@@ -12,7 +12,8 @@ import { buildCriteria, parseGmailQuery, tokenize } from "../src/providers/imap-
 import { decodeId, encodeId, ensureHeaders, ImapProvider, stripBcc } from "../src/providers/imap.js";
 import { MailRegistry } from "../src/providers/registry.js";
 import { startFakeGmail } from "./fake-gmail.js";
-import { FAKE_IMAP, FakeMailServers, startFakeMailServers } from "./fake-imap.js";
+import { buildOutgoing } from "../src/tools/compose.js";
+import { FAKE_IMAP, FakeMailServers, minimalStorage, startFakeMailServers } from "./fake-imap.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tmp = (p = "gmm-imap-") => fs.mkdtempSync(path.join(os.tmpdir(), p));
@@ -57,6 +58,66 @@ describe("Gmail query -> IMAP search", () => {
     expect(buildCriteria([["from", "a"], ["from", "b"], ["from", "c"]])).toEqual({ from: "a", or: [{ from: "b", or: [{ from: "c" }] }] });
     // both "or" and "not" already used at this level: wrap, and AND the rest through a double NOT
     expect(buildCriteria([["or", [1]], ["not", 2], ["or", [3]]])).toEqual({ or: [{ or: [1], not: 2 }], not: { not: { or: [3] } } });
+  });
+
+  it("reports what it can't apply instead of silently widening the search", () => {
+    const cases: Record<string, string[]> = {
+      "category:promotions older_than:30d": ["category:promotions"],
+      "filename:pdf": ["filename:pdf"],
+      "list:x": ["list:x"],
+      "is:important foo": ["is:important"],
+      "has:drive deliveredto:me@x.com": ["has:drive", "deliveredto:me@x.com"],
+      "after:yesterday larger:huge": ["after:yesterday (invalid date)", "larger:huge (invalid size)"],
+    };
+    for (const [query, ignored] of Object.entries(cases)) expect(parseGmailQuery(query, now).ignored, query).toEqual(ignored);
+    expect(parseGmailQuery("filename:pdf", now).criteria).toEqual({ all: true });
+    expect(parseGmailQuery("is:important foo", now).criteria).toEqual({ text: "foo" });
+
+    const negIn = parseGmailQuery("-in:sent from:a", now);
+    expect(negIn.ignored).toHaveLength(1);
+    expect(negIn.ignored[0]).toMatch(/^-in:sent/);
+    expect(negIn.criteria).toEqual({ from: "a" });
+    expect(negIn.roles).toEqual([]);
+    expect(parseGmailQuery("-label:Clients x", now).ignored[0]).toMatch(/^-label:Clients/);
+
+    // Simple supported queries report nothing.
+    for (const ok of ["from:a@b.com is:unread", "in:sent", 'label:"Clients/Acme" newer_than:2d', "has:attachment -from:x", ""]) {
+      expect(parseGmailQuery(ok, now).ignored, ok).toEqual([]);
+    }
+  });
+
+  it("translates parenthesised and braced groups instead of searching for their text", () => {
+    const g = parseGmailQuery("(from:a OR from:b)", now);
+    expect(g.ignored).toEqual([]);
+    expect(g.criteria).toEqual({ or: [{ from: "a" }, { from: "b" }] });
+    expect(JSON.stringify(g.criteria)).not.toContain("text");
+    expect(parseGmailQuery("-(from:a OR from:b) is:unread", now).criteria).toEqual({ not: { or: [{ from: "a" }, { from: "b" }] }, seen: false });
+    expect(parseGmailQuery("{from:a from:b}", now).criteria).toEqual({ or: [{ from: "a" }, { from: "b" }] });
+    expect(parseGmailQuery("from:a OR (subject:x is:unread)", now).criteria).toEqual({ or: [{ from: "a" }, { subject: "x", seen: false }] });
+    expect(parseGmailQuery('subject:"(draft)" x', now).criteria).toEqual({ subject: "(draft)", text: "x" });
+
+    // Things that only work at the top level are reported when grouped.
+    const loc = parseGmailQuery("(in:sent OR from:a)", now);
+    expect(loc.ignored[0]).toMatch(/^in:sent \(inside a group/);
+    expect(loc.roles).toEqual([]);
+    expect(parseGmailQuery("(newer_than:2d OR from:a)", now).ignored[0]).toMatch(/^newer_than:2d \(inside a group/);
+    expect(parseGmailQuery("(has:attachment OR from:a)", now).ignored[0]).toMatch(/^has:attachment \(inside a group/);
+
+    const open = parseGmailQuery("(from:a", now);
+    expect(open.ignored).toEqual(["unbalanced parentheses"]);
+    expect(open.criteria).toEqual({ from: "a" });
+    expect(parseGmailQuery("from:a)", now).ignored).toEqual(['unbalanced ")"']);
+  });
+
+  it("makes newer_than / older_than exact at the top level", () => {
+    const o = parseGmailQuery("older_than:30d", now);
+    expect(o.ignored).toEqual([]);
+    expect(o.notAfter?.toISOString()).toBe("2026-09-26T12:00:00.000Z");
+    expect(o.criteria).toEqual({ before: new Date(Date.UTC(2026, 8, 27)) }); // whole day on the server, exact afterwards
+    expect(parseGmailQuery("-newer_than:2d", now).notAfter?.toISOString()).toBe("2026-10-24T12:00:00.000Z");
+    expect(parseGmailQuery("-older_than:3h", now).notBefore?.toISOString()).toBe("2026-10-26T09:00:00.000Z");
+    // Inside a group older_than rounds to whole days, never broader than asked.
+    expect(parseGmailQuery("(older_than:1d OR from:a)", now).criteria).toEqual({ or: [{ before: new Date(Date.UTC(2026, 9, 25)) }, { from: "a" }] });
   });
 
   it("encodes ids and headers", () => {
@@ -241,11 +302,129 @@ describe("ImapProvider against a real IMAP + SMTP server", () => {
     await noSmtp.close();
   });
 
+  it("returns ignored query parts with the results, and applies groups and exact ages live", async () => {
+    const wide = await p.search({ query: "category:promotions older_than:1d", max: 10 });
+    expect(wide.ignored).toEqual(["category:promotions"]);
+    expect((await p.search({ query: "from:maria", max: 5 })).ignored).toBeUndefined();
+    expect(subjects(await p.search({ query: "(from:bob@client.example OR from:carol@x.example)", max: 10 }))).toEqual(["Ερώτηση για τιμολόγιο", "Old thing"]);
+    expect(subjects(await p.search({ query: "-(from:bob@client.example OR from:carol@x.example) is:read", max: 10 }))).toEqual(["note to self"]);
+    // Bob's mail is 50h old, Maria's 30h, Carol's 20 days.
+    expect(subjects(await p.search({ query: "older_than:2d", max: 10 }))).toEqual(["Ερώτηση για τιμολόγιο", "Old thing"]);
+    expect(subjects(await p.search({ query: "older_than:19d", max: 10 }))).toEqual(["Old thing"]);
+    expect(subjects(await p.search({ query: "older_than:21d", max: 10 }))).toEqual([]);
+    const negLoc = await p.search({ query: "-in:sent from:bob", max: 10 });
+    expect(negLoc.ignored?.[0]).toMatch(/^-in:sent/);
+  });
+
+  it("refuses to delete or send anything that is not a draft", async () => {
+    const inbox = (await p.search({ query: "from:maria", max: 1 })).messages[0];
+    await expect(p.deleteDraft(inbox.id)).rejects.toThrow(/not in the Drafts folder/);
+    await expect(p.sendDraft(inbox.id)).rejects.toThrow(/not in the Drafts folder/);
+    expect(servers.sent).toHaveLength(0);
+    expect(subjects(await p.search({ query: "from:maria", max: 5 }))).toEqual(["Προσφορά βιτρίνας"]); // still there
+
+    // A message sitting in Drafts without the \Draft flag is not a draft either.
+    // @ts-expect-error private: append straight into Drafts like another client might
+    const c = await p.conn();
+    const r = await c.append("Drafts", "From: x@y\r\nTo: z@w\r\nSubject: not really a draft\r\nMessage-ID: <nd@x>\r\n\r\nx", ["\\Seen"]);
+    const id = encodeId("Drafts", r.uid);
+    await expect(p.deleteDraft(id)).rejects.toThrow(/no \\Draft flag/);
+    await expect(p.sendDraft(id)).rejects.toThrow(/no \\Draft flag/);
+    expect(servers.sent).toHaveLength(0);
+
+    // Real drafts still work.
+    const d = await p.saveDraft(buildMime({ from: "antony@psdgator.com", to: ["bob@client.example"], subject: "ok draft", text: "x" }));
+    await p.deleteDraft(d.draftId);
+  });
+
+  it("reports a successful send even if removing the draft afterwards fails", async () => {
+    const d = await p.saveDraft(buildMime({ from: "antony@psdgator.com", to: ["carol@x.example"], subject: "once", text: "x" }));
+    const orig = p.deleteDraft.bind(p);
+    p.deleteDraft = async () => {
+      throw new Error("server hiccup");
+    };
+    const r = await p.sendDraft(d.draftId);
+    p.deleteDraft = orig;
+    expect(servers.sent).toHaveLength(1);
+    expect(r.warning).toMatch(/WAS sent.*server hiccup.*do not send it again/);
+  });
+
+  it("refuses labels that would move mail into or out of Trash, Spam, Drafts or Sent", async () => {
+    const m = (await p.search({ query: "from:maria", max: 1 })).messages[0];
+    await expect(p.modify([m.id], { addLabels: ["Trash"] })).rejects.toThrow(/trash folder.*use trash_emails \(full mode\)/);
+    await expect(p.modify([m.id], { addLabels: ["junk"] })).rejects.toThrow(/junk folder/);
+    await expect(p.modify([m.id], { addLabels: ["Drafts"] })).rejects.toThrow(/drafts folder/);
+    await expect(p.modify([m.id], { addLabels: ["Sent"] })).rejects.toThrow(/sent folder/);
+    await expect(p.modify([m.id], { removeLabels: ["Sent"] })).rejects.toThrow(/sent folder/);
+    await expect(p.modify([m.id], { removeLabels: ["Trash"] })).rejects.toThrow(/trash folder/);
+    expect(subjects(await p.search({ query: "in:trash", max: 5 }))).toEqual([]);
+    expect(subjects(await p.search({ query: "in:spam", max: 5 }))).toEqual([]);
+    expect(subjects(await p.search({ query: "from:maria", max: 5 }))).toEqual(["Προσφορά βιτρίνας"]);
+  });
+
   it("reconnects after the connection drops", async () => {
     await p.inboxStatus();
     // @ts-expect-error reach into the private client to simulate a dropped socket
     p.client?.close();
     expect(await p.inboxStatus()).toEqual({ unread: 2, total: 5 });
+  });
+});
+
+describe("ImapProvider on a bare mailbox (no Drafts folder, group addresses)", () => {
+  let servers: FakeMailServers;
+  let acc: AccountConfig;
+  let p: ImapProvider;
+
+  beforeEach(async () => {
+    servers = await startFakeMailServers({ storage: minimalStorage() });
+    const accounts = new AccountManager(tmp());
+    acc = accounts.addAccount("bare", "antony@psdgator.com", undefined, {
+      type: "imap",
+      imap: { host: "127.0.0.1", port: servers.imapPort, secure: false, user: FAKE_IMAP.user, allowInsecureTls: true },
+      smtp: { host: "127.0.0.1", port: servers.smtpPort, secure: false, user: FAKE_IMAP.user, allowInsecureTls: true },
+    });
+    accounts.saveCredentials("bare", { password: FAKE_IMAP.pass });
+    p = new MailRegistry(accounts).get(acc) as ImapProvider;
+    return async () => {
+      await p.close();
+      await servers.close();
+    };
+  });
+
+  it("never deletes or sends inbox mail when there is no Drafts folder", async () => {
+    const all = (await p.search({ query: "", max: 10 })).messages;
+    expect(all).toHaveLength(2);
+    for (const m of all) {
+      await expect(p.deleteDraft(m.id)).rejects.toThrow(/has no Drafts folder/);
+      await expect(p.sendDraft(m.id)).rejects.toThrow(/has no Drafts folder/);
+    }
+    expect(servers.sent).toHaveLength(0);
+    expect((await p.search({ query: "", max: 10 })).messages).toHaveLength(2);
+    expect(await p.listDrafts(5)).toEqual([]);
+  });
+
+  it("recognises protected folders by name when they have no special-use flag", async () => {
+    const m = (await p.search({ query: "", max: 1 })).messages[0];
+    await expect(p.modify([m.id], { addLabels: ["Spam"] })).rejects.toThrow(/junk folder/);
+    await expect(p.modify([m.id], { addLabels: ["Κάδος"] })).rejects.toThrow(/trash folder/);
+    const r = await p.modify([m.id], { addLabels: ["Clients"] });
+    expect(r.added).toEqual(["Clients"]);
+  });
+
+  it("skips group-syntax addresses so reply-all works", async () => {
+    const g = (await p.search({ query: "subject:Group", max: 1 })).messages[0];
+    expect(g.to).toBe("");
+    expect(g.to).not.toContain("<>");
+    expect(g.cc).toBe("a@team.example, Bee <b@team.example>");
+    const h = await p.getOriginalHeaders(g.id);
+    expect(h.to).toBe("");
+    expect(h.cc).toBe("a@team.example, Bee <b@team.example>");
+    const out = await buildOutgoing(p, acc, { body: "Thanks!", replyToMessageId: g.id, replyAll: true });
+    expect(out.to).toEqual(["Dimitris <dim@x.example>"]);
+    expect(out.cc).toEqual(["a@team.example", "Bee <b@team.example>"]);
+    expect(out.raw).not.toContain("<>");
+    const parsed = await simpleParser(out.raw);
+    expect(parsed.subject).toBe("Re: Group mail");
   });
 });
 
