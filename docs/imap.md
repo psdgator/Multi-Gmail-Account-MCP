@@ -40,10 +40,10 @@ gmail-mcp-multi add-imap company you@yourdomain.com --host mail.your-server.de -
 
 | Gmail | IMAP account |
 |---|---|
-| Labels | Folders. `addLabels` **copies** the message into the folder; `removeLabels` (when the message is in that folder) moves it back to INBOX. `create_label "Clients/Acme"` creates nested folders. |
+| Labels | Folders. `addLabels` **copies** the message into the folder; `removeLabels` (when the message is in that folder) moves it back to INBOX. `create_label "Clients/Acme"` creates nested folders. Trash, Junk/Spam, Drafts, Sent and All Mail can't be used as labels (found by special-use flag or by name, in several languages), so labels can never trash or spam mail. Use `trash_emails` (full mode) to trash. |
 | Archive | Moves to the Archive folder (special-use `\Archive`, or a folder named Archive; created if missing). |
 | Trash | Moves to Trash (`\Trash`). |
-| Drafts | Saved in the Drafts folder with the `\Draft` flag. Open them in your mail app (Thunderbird, webmail). |
+| Drafts | Saved in the Drafts folder with the `\Draft` flag. Open them in your mail app (Thunderbird, webmail). `delete_draft` and `send_draft` only accept messages that are in the Drafts folder **and** carry the `\Draft` flag. Anything else, or any message in a mailbox without a Drafts folder, is refused. |
 | Sent | Sent through SMTP (full mode only). A copy is saved in Sent, and **Bcc is removed** from the transmitted message. |
 | Threads | Rebuilt from `Message-ID` / `References` / `In-Reply-To` across INBOX, Sent and Archive. |
 | Starred / unread | `\Flagged` / `\Seen` flags. |
@@ -63,11 +63,17 @@ Supported:
 - `rfc822msgid:`
 - `in:inbox` `in:sent` `in:drafts` `in:trash` `in:spam` `in:archive` `in:anywhere`
 - `label:<folder>` (or `in:<folder>`)
-- negation with `-`, and `a OR b`
+- negation with `-`, `a OR b`, grouping with `( )`, and `{a b}` (Gmail's OR-group)
 
 By default only INBOX is searched (Gmail searches everything except Spam/Trash; use `in:anywhere` for that on IMAP).
 
-Not supported (ignored): `category:`, `is:important`, `has:drive`/`has:youtube`, `list:`, `filename:`, `deliveredto:`, and parentheses/`{}` grouping.
+`newer_than:` / `older_than:` are exact (checked to the second) at the top level of a query. Inside a group, `older_than:` rounds to whole days, so it never matches more than asked.
+
+**Not supported, and reported:** `category:`, `is:important`, `has:drive`/`has:youtube`, `list:`, `filename:`, `deliveredto:`, unknown operators, invalid dates or sizes, and unbalanced parentheses. Also reported:
+- negated folders (`-in:sent`, `-label:x`)
+- folders, `has:attachment` or `newer_than:` inside a group, e.g. `(in:sent OR from:a)`
+
+Nothing is dropped silently. The search result lists these parts under `ignored`, because the matches may then be broader than the query intended. Bulk actions (`bulk_cleanup`) refuse to run on such a query, so rephrase it with supported operators.
 
 Greek and other non-ASCII search terms are sent as UTF-8. Most servers, including Dovecot at Hetzner, match them in decoded headers and bodies.
 
