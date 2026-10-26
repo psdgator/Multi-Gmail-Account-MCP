@@ -1,164 +1,138 @@
 # gmail-mcp-multi
 
-A Gmail MCP server with native multi-account support. Manage multiple Gmail accounts from a single server instance.
+A Gmail MCP server that works with **many Gmail accounts at once**.
 
-Unlike other Gmail MCPs that require running separate server instances per account, this one lets you specify which account to use on each tool call—making it easy to manage personal and work inboxes from Claude Code, Cursor, or any MCP client.
+- Tell Claude *which* mailbox to use by a friendly alias: "check the **urbanstickers** inbox", "draft a reply from **psdgator**".
+- Or ask across **all** of them: "what's unread in all my accounts?", "find every invoice from DHL this month". Results from every account are merged newest-first and tagged with the account they came from.
+- **Safe by default**: the default `drafts` mode can read, organize and write drafts, but **cannot send**. You review and send from Gmail.
 
-## Features
+> Fork of [dmorrill/gmail-mcp-multi](https://github.com/dmorrill/gmail-mcp-multi). Upstream's `main` was an unfinished scaffold (no login, several tools missing). This fork merges the open community PRs (#7, #9, #10, #11, #13, #14, #15), rewrites the server on the current MCP SDK and adds real multi-account features. Credits below.
 
-- **Multi-account support** - Single server instance, unlimited Gmail accounts
-- **Account aliases** - Use friendly names like "work" or "personal" instead of email addresses
-- **Full Gmail API** - Search, read, send, label, and manage emails
-- **Batch operations** - Bulk modify or delete emails efficiently
-- **Auto token refresh** - Handles OAuth token refresh automatically
+## Tools
 
-## Installation
+| Tool | Mode | Accounts | What it does |
+|---|---|---|---|
+| `list_accounts` | readonly | – | Connected accounts, default, sign-in status |
+| `authenticate` | readonly | one | Connect an account (opens Google sign-in in your browser) |
+| `set_default_account` | readonly | one | Default for single-account tools |
+| `search_emails` | readonly | **many** | Gmail query syntax; all accounts by default, merged and sorted |
+| `inbox_summary` | readonly | **many** | Unread counts per inbox + newest unread messages |
+| `read_email` | readonly | one | Clean text body (HTML converted), labels, attachment list |
+| `read_thread` | readonly | one | Whole conversation |
+| `list_labels` / `list_drafts` / `list_filters` | readonly | **many** | |
+| `save_attachment` | readonly | one | Save an attachment to a local folder |
+| `create_draft` | drafts | one | New mail or threaded reply / reply-all, send-as address, Gmail signature, attachments |
+| `delete_draft` | drafts | one | |
+| `modify_emails` | drafts | one | Mark read/unread, star, archive, move to Inbox, add/remove labels by **name** (bulk, up to 1000) |
+| `create_label` | drafts | one | |
+| `send_email` / `send_draft` | **full** | one | Send |
+| `trash_emails` | **full** | one | Move to Trash |
+| `create_filter` / `delete_filter` | **full** | one | Gmail filters |
 
-This package is not published to npm yet, so install it from source:
+The `account` argument takes an alias, an email address, a list, or `"all"`. Leave it out and the multi-account tools use **every** account, while single-account tools use the default account. `read_email` and `read_thread` will even find the message in the right account if you leave `account` out.
+
+### Modes
+
+| Mode | Google permission requested | Can do |
+|---|---|---|
+| `readonly` | `gmail.readonly` | search, read, list, save attachments |
+| `drafts` (default) | `gmail.modify` | + drafts, labels, read/unread, archive. **No sending.** |
+| `full` | `gmail.modify` + `gmail.settings.basic` | + send, trash, filters |
+
+Start the server with `--mode readonly|drafts|full` (or `GMAIL_MCP_MODE`). You can also cap a single account lower, for example to keep one mailbox read-only: `gmail-mcp-multi limit psdgator readonly`.
+
+> Google has no permission that allows drafts but blocks sending. In `drafts` mode the "never sends" guarantee comes from this server simply having no send tool, so keep the mode at `drafts` or `readonly` if that matters to you.
+
+## Setup
+
+Requires **Node.js 20.19+**.
+
+### 1. Install
 
 ```bash
-git clone https://github.com/dmorrill/gmail-mcp-multi.git
+git clone https://github.com/psdgator/gmail-mcp-multi.git
 cd gmail-mcp-multi
-npm install
-npm run build
+npm install        # also builds dist/
 ```
 
-That produces `dist/index.js`, which is the server entry point your MCP client
-runs. Note the absolute path to it — you'll need it below.
+### 2. Create a Google OAuth client (once)
 
-## Quick Start
+1. [Google Cloud Console](https://console.cloud.google.com/): create a project. Use a personal Gmail account as the owner if you might leave Google Workspace later.
+2. **APIs & Services → Library** → enable **Gmail API**.
+3. **Google Auth Platform → Branding/Audience**: User type **External**. Add your addresses as test users, then press **Publish app** (status "In production").
+   *If the app stays in "Testing", Google expires your logins every 7 days.* For personal use you'll see an "unverified app" warning once per account. Click *Advanced → Go to … (unsafe)*.
+4. **Clients → Create client → Desktop app** → download the JSON.
+5. Save it as `~/.gmail-mcp/oauth-keys.json` (Windows: `C:\Users\<you>\.gmail-mcp\oauth-keys.json`).
 
-### 1. Set up Google Cloud OAuth
+Google Workspace accounts: the Workspace admin may need to allow the app under *Security → API controls → App access control*.
 
-You'll need OAuth credentials from Google Cloud Console:
+### 3. Connect accounts
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project (or use existing)
-3. Enable the Gmail API
-4. Create OAuth 2.0 credentials (Desktop app type)
-5. Download the credentials JSON
-
-### 2. Configure the MCP
-
-Create `~/.gmail-mcp/oauth-keys.json` with your OAuth credentials.
-
-### 3. Add to your MCP client
-
-**Claude Code:**
 ```bash
-claude mcp add gmail -- node /absolute/path/to/gmail-mcp-multi/dist/index.js
+node dist/index.js auth urbanstickers urbanstickersgr@gmail.com
+node dist/index.js auth psdgator antony@psdgator.com
+node dist/index.js default urbanstickers
+node dist/index.js doctor          # checks the setup and every account
 ```
 
-**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`
-on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+Or, once the server is added to Claude, just say *"connect my work Gmail as 'work'"*. The `authenticate` tool opens the sign-in page for you.
+
+### 4. Add to Claude
+
+**Claude desktop app** (`claude_desktop_config.json`, *Settings → Developer → Edit Config*):
+
 ```json
 {
   "mcpServers": {
-    "gmail": {
-      "command": "/usr/local/bin/node",
-      "args": ["/absolute/path/to/gmail-mcp-multi/dist/index.js"]
+    "gmail-multi": {
+      "command": "node",
+      "args": ["C:\\Users\\you\\projects\\gmail-mcp-multi\\dist\\index.js", "--mode", "drafts"]
     }
   }
 }
 ```
 
-Both paths must be absolute. Claude Desktop in particular launches servers with a
-minimal `PATH`, so a bare `node` may not resolve — use the output of `which node`.
-
-### 4. Authenticate accounts
-
-Authentication runs as a one-off Node script (it needs to open a browser and
-listen on a localhost port, which doesn't fit inside an MCP request). After
-`npm run build`, from the project checkout:
+**Claude Code**:
 
 ```bash
-node dist/auth.js personal you@gmail.com
-node dist/auth.js work you@company.com
+claude mcp add gmail-multi -- node /path/to/gmail-mcp-multi/dist/index.js --mode drafts
 ```
 
-Each invocation prints a Google authorization URL, listens on
-`http://127.0.0.1:<random-port>` for the redirect, exchanges the code for
-tokens, and writes them to `~/.gmail-mcp/accounts/<alias>/credentials.json`.
-
-The script requests the `gmail.readonly` scope, so the resulting tokens
-can never mutate the mailbox even if the MCP server is later started
-without `--readonly`.
-
-For multi-org setups (accounts in different Google Workspace
-organizations), drop a per-account `oauth-keys.json` into
-`~/.gmail-mcp/accounts/<alias>/` before running the script — see
-"Configuration" below.
-
-### 5. Use it!
+## Files
 
 ```
-search_emails({ account: "work", query: "in:inbox is:unread" })
-search_emails({ account: "personal", query: "from:mom" })
+~/.gmail-mcp/                 (override with GMAIL_MCP_HOME)
+├── config.json               accounts, aliases, default, per-account limits
+├── oauth-keys.json           your Google OAuth client
+└── accounts/<alias>/
+    ├── credentials.json      refresh token (owner-only permissions)
+    └── oauth-keys.json       optional per-account OAuth client
 ```
 
-## Tools
-
-All tools that interact with Gmail require an `account` parameter (alias or email).
-
-### Account Management
-| Tool | Description |
-|------|-------------|
-| `list_accounts` | List all configured accounts and auth status |
-| `authenticate` | Add or re-authenticate an account |
-
-### Email Operations
-| Tool | Description |
-|------|-------------|
-| `search_emails` | Search emails using Gmail query syntax |
-| `read_email` | Get full content of an email by ID |
-| `send_email` | Send a new email |
-| `draft_email` | Create a draft |
-| `modify_email` | Add/remove labels, mark read/unread |
-| `delete_email` | Trash or permanently delete |
-| `batch_modify_emails` | Bulk label operations |
-| `batch_delete_emails` | Bulk delete |
-
-### Label Management
-| Tool | Description |
-|------|-------------|
-| `list_labels` | Get all labels for an account |
-| `create_label` | Create a new label |
-| `delete_label` | Delete a label |
-
-## Configuration
-
-Credentials are stored in `~/.gmail-mcp/`:
-
-```
-~/.gmail-mcp/
-├── config.json           # Account aliases and settings
-├── oauth-keys.json       # Your Google OAuth app credentials
-└── accounts/
-    ├── work/
-    │   └── credentials.json
-    └── personal/
-        └── credentials.json
-```
-
-These files hold OAuth refresh tokens that grant ongoing access to your mailboxes.
-The server creates its directories as `0700` and its credential files as `0600`, and
-re-applies those permissions on startup to tighten anything left behind by an earlier
-version. Never commit them or place them on a shared filesystem.
+To remove an account: `node dist/index.js remove <alias>`. You can also revoke access at <https://myaccount.google.com/permissions>.
 
 ## Development
 
 ```bash
-git clone https://github.com/dmorrill/gmail-mcp-multi.git
-cd gmail-mcp-multi
-npm install
 npm run build
-npm run dev
+npm test      # unit tests + end-to-end tests against a fake Gmail API (no real mail touched)
 ```
 
-## Contributing
+`GMAIL_MCP_API_ROOT` points the server at another Gmail-compatible endpoint (used by the tests); `GMAIL_MCP_NO_BROWSER=1` stops it from opening a browser.
 
-Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+## Roadmap
 
-## License
+- Remote (HTTP) mode so the same server can be added as a custom connector in Claude on the web and mobile
+- Batch API for faster large searches; attachment text extraction (PDF/DOCX)
+- Unified "daily digest" prompt across accounts
 
-MIT
+## Credits
+
+- Original project and scaffold: **Elle Morrill** (dmorrill/gmail-mcp-multi)
+- Secure credential storage, install docs: **Dave Moudy** (PR #15)
+- Per-account OAuth clients, standalone auth, read-only switch: **Vadim Zaliva** (PR #13)
+- Attachments, RFC 2047 subjects, labels and filters: **Bobby Marko** (PRs #9, #10, #11)
+- Attachment download: PR #14
+- Multi-account fan-out, modes, drafts/replies, rewrite: **Antonis Papamichail** ([psdgator](https://github.com/psdgator))
+
+MIT licensed.
