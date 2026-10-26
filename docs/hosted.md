@@ -94,19 +94,24 @@ Claude's OAuth callback is `https://claude.ai/api/mcp/auth_callback` (and, in fu
 - **Nothing is reachable without the password.** Anyone can register an OAuth client, but only someone who knows `GMAIL_MCP_HTTP_PASSWORD` can approve it. The server refuses to start if the password is missing or shorter than 12 characters.
 - **Brute force:**
   - The password is compared in constant time.
-  - 5 wrong attempts from one IP lock that IP for 15 minutes; 25 failures overall lock the form for everyone for 15 minutes.
+  - 5 wrong attempts from one IP (for IPv6: from one /64 network) lock that address. The first lock lasts 5 minutes, and each further lock doubles, up to 1 hour.
+  - There is no global lock. Many failures from different addresses only add a short delay (at most 2 seconds) to every attempt. Your correct password from your own address is never refused because of someone else's attempts.
   - Each failure is answered slowly.
   - The SDK also rate-limits the OAuth endpoints.
 - **OAuth 2.1:**
   - PKCE (S256) is mandatory.
   - Authorization codes are single-use and expire after 5 minutes. Replaying a code revokes the tokens it produced.
   - Access tokens are random 256-bit values that last 1 hour.
-  - Refresh tokens last 30 days and **rotate** on every use. Reusing an old refresh token revokes the whole session.
+  - Refresh tokens last 30 days and **rotate** on every use. Reusing an old refresh token revokes the whole session. The exception is a reuse within 60 seconds, which covers a lost response or two refreshes at once.
   - Tokens are bound to this server's `/mcp` resource (RFC 8707), so tokens issued for any other resource are refused.
 - **Storage:**
   - Tokens are stored only as SHA-256 hashes. The token/client file (`/data/http-auth.json`) and all mail logins are encrypted with AES-256-GCM using `GMAIL_MCP_MASTER_KEY`.
   - **Back up that key.** Without it the stored logins can't be decrypted. If it leaks, rotate it and sign in again.
-- **Redirects:** only Claude's callback URLs and loopback addresses (for local tools) may be registered. Override with `GMAIL_MCP_HTTP_ALLOWED_REDIRECTS` (exact URIs, or prefixes ending in `*`). Use `--no-loopback-redirects` to drop loopback.
+- **Redirects:** only Claude's callback URLs and loopback addresses (for local tools) may be registered.
+  - Override with `GMAIL_MCP_HTTP_ALLOWED_REDIRECTS`: exact URIs, or prefixes ending in `*`.
+  - A prefix only matches at a boundary (`/`, `?`, `#` or the end), so `https://app.example.com*` does not match `https://app.example.com.evil.net`.
+  - Use `--no-loopback-redirects` to drop loopback.
+- **Client registrations:** at most 100 clients are kept. When the limit is reached, the oldest clients that registered but never completed a sign-in (and are older than 10 minutes) are dropped to make room. Clients that signed in are never dropped automatically.
 - **Browser protections:**
   - The `Host` header must be your domain, which protects against DNS rebinding.
   - Browser `Origin`s other than your domain and claude.ai/claude.com are refused.
@@ -114,7 +119,9 @@ Claude's OAuth callback is `https://claude.ai/api/mcp/auth_callback` (and, in fu
 - **Sessions:** each MCP session belongs to the client that opened it. Another client's token can't use it. Idle sessions close after 30 minutes.
 - **Reduced tools:** `save_attachment` (it would write to the server's disk) and `authenticate` are not offered in hosted mode. Use `read_attachment` and the CLI instead.
 - **Audit log:** every tool call is logged to `/data/audit.log` with `"via":"http"`. Ask Claude for `view_audit_log`, or run `docker compose run --rm app audit`.
-- **Signing everything out:** run `docker compose run --rm app http-logout --clients`. You can also change the password and restart.
+- **Signing everything out:**
+  - Run `docker compose run --rm app http-logout` (add `--clients` to also forget registered apps). The running server picks this up at once; no restart needed.
+  - **Changing the access password also signs everything out.** At startup the server compares the configured password with a fingerprint of the previous one (scrypt, stored in the encrypted `http-auth.json`; the password itself is never stored). If it changed, every token is revoked and Claude must connect again with the new password.
 - **Mode:** keep `drafts` (never sends) or `readonly` unless you really want Claude to send mail from the web.
 
 Email content is untrusted. A malicious email can contain instructions aimed at the AI. The server tells Claude to ignore those, and `drafts` mode keeps the damage limited to drafts you review.
@@ -157,6 +164,6 @@ Note that TLS then ends at Cloudflare, which can see the traffic. A VPS with Cad
 | Claude says the connector failed to connect | `curl https://host/healthz` from outside; check DNS, ports 80/443, `docker compose logs` |
 | `redirect_uri not allowed` | Add Claude's callback to `GMAIL_MCP_HTTP_ALLOWED_REDIRECTS` if it changed |
 | `403 Invalid Host` | The request used a host name other than `GMAIL_MCP_PUBLIC_URL`; add it to `GMAIL_MCP_HTTP_ALLOWED_HOSTS` |
-| "Too many wrong passwords" | Wait 15 minutes, or restart the app |
+| "Too many wrong passwords" | Wait the time shown (5 minutes for a first lock; it doubles for repeated locks from the same address), connect from another network, or restart the app |
 | Tools work, but an account fails | `docker compose run --rm app doctor`; re-run `auth … --manual` for that account |
 | Everything signed out after a restart | `GMAIL_MCP_MASTER_KEY` changed; restore the old key |

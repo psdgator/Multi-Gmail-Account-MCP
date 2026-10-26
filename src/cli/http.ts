@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import { AccountManager } from "../accounts.js";
 import { AuthStore } from "../http/auth-store.js";
 import { startHttpServer, validatePassword } from "../http/server.js";
-import { extraCommands } from "../index.js";
+import { extraCommands } from "./common.js";
 import { VERSION } from "../version.js";
 
 /** Minimal flag parsing (kept local so this module does not depend on index.ts helpers). */
@@ -50,7 +50,7 @@ extraCommands["serve-http"] = {
   help: `  gmail-mcp-multi serve-http --public-url https://mail.example.com [--port 8787] [--host 127.0.0.1]
                                                   Hosted mode for claude.ai custom connectors (Streamable HTTP + OAuth).
                                                   Needs GMAIL_MCP_HTTP_PASSWORD (12+ chars). See docs/hosted.md
-  gmail-mcp-multi http-logout [--clients]         Revoke all hosted-mode tokens (and registered clients)`,
+  gmail-mcp-multi http-logout [--clients]         Revoke all hosted-mode tokens (and registered clients); takes effect immediately`,
   run: async (args, mode) => {
     const publicUrl = flag(args, "--public-url") ?? process.env.GMAIL_MCP_PUBLIC_URL;
     if (!publicUrl) throw new Error("Pass --public-url https://your-host (or set GMAIL_MCP_PUBLIC_URL).");
@@ -90,6 +90,7 @@ extraCommands["http-logout"] = {
     const before = store.stats();
     const r = store.revokeAll(alsoClients);
     console.log(`Revoked ${r.tokens} tokens${alsoClients ? ` and ${r.clients} registered clients` : ""} (had ${before.clients} clients).`);
+    console.log("A running server picks this up immediately; no restart needed.");
     console.log("Connected apps (e.g. claude.ai) must connect again and enter the server password.");
   },
 };
