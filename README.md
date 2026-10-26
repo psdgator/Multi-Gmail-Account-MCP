@@ -55,6 +55,8 @@ cd gmail-mcp-multi
 npm install        # also builds dist/
 ```
 
+> If your system has `NODE_ENV=production` set, npm skips the build tools. Use `npm install --include=dev` instead.
+
 ### 2. Create a Google OAuth client (once)
 
 1. [Google Cloud Console](https://console.cloud.google.com/): create a project. Use a personal Gmail account as the owner if you might leave Google Workspace later.
@@ -73,6 +75,7 @@ node dist/index.js auth urbanstickers urbanstickersgr@gmail.com
 node dist/index.js auth psdgator antony@psdgator.com
 node dist/index.js default urbanstickers
 node dist/index.js doctor          # checks the setup and every account
+npm run smoke                      # live read-only test through the MCP server (add -- --draft to test drafts)
 ```
 
 Or, once the server is added to Claude, just say *"connect my work Gmail as 'work'"*. The `authenticate` tool opens the sign-in page for you.

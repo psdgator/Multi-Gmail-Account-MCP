@@ -9,7 +9,9 @@
   },
   "files": [
     "dist",
+    "scripts",
     "README.md",
+    "PRIVACY.md",
     "LICENSE"
   ],
   "scripts": {
@@ -19,7 +21,8 @@
     "auth": "node dist/index.js auth",
     "accounts": "node dist/index.js accounts",
     "test": "npm run build && vitest run",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "smoke": "node scripts/smoke.mjs"
   },
   "keywords": [
     "mcp",
