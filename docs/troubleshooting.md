@@ -15,6 +15,9 @@ Start with `gmail-mcp-multi doctor`. It checks the OAuth client file, the encryp
 | `The Google API for this action is not enabled` | Enable the Gmail API or Google Calendar API in your Cloud project. |
 | `Could not decrypt stored credentials` | The encryption key changed (new machine, keychain reset, or a different `GMAIL_MCP_MASTER_KEY`). Reconnect the account. |
 | `No OS keychain available; stored the encryption key in …master.key` | Normal on headless Linux. Set `GMAIL_MCP_MASTER_KEY` to keep the key outside the config folder. |
+| `… is outside the folders this server may use` / `… hidden file` / `… protected location` | Attachments can only be read from, and saved to, normal folders under your home folder. Add other folders with `GMAIL_MCP_ALLOWED_DIRS` (e.g. `D:\Work`). See [Security → Local files](security.md#local-files). |
+| `This search can't be applied exactly on "x"` | `bulk_cleanup` refuses queries the mailbox can't apply exactly (IMAP and Gmail-only operators). Rephrase without the listed parts. |
+| `encrypted with a different key` / `Not creating a new key over existing encrypted logins` | The encryption key is missing or different (new machine, keychain reset, changed `GMAIL_MCP_MASTER_KEY`). Restore it, or remove and reconnect the accounts. |
 | `IMAP login failed for "x"` | Wrong password or login name. Run `gmail-mcp-multi add-imap x …` again. See [IMAP](imap.md). |
 | `Calendar access is not enabled for "x"` | Reconnect with `--calendar` ([Calendar](calendar.md)). |
 | Search finds nothing on an IMAP account | IMAP searches INBOX by default; add `in:anywhere`. Gmail-only operators like `category:` are ignored. |

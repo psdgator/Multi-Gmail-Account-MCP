@@ -169,7 +169,8 @@ export interface MailProvider {
   listDrafts(max: number): Promise<DraftSummary[]>;
   deleteDraft(draftId: string): Promise<void>;
   send(raw: string, threadId?: string): Promise<{ messageId?: string; threadId?: string }>;
-  sendDraft(draftId: string): Promise<{ messageId?: string; threadId?: string }>;
+  /** `warning` when the email WAS sent but cleaning up afterwards failed (never retry then). */
+  sendDraft(draftId: string): Promise<{ messageId?: string; threadId?: string; warning?: string }>;
   needsReply(opts: NeedsReplyOptions): Promise<NeedsReplyResult>;
   /** Web link to open a message/thread, if the provider has one. */
   webUrl?(threadOrMessageId: string): string | undefined;

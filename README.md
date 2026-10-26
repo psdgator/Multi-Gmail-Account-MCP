@@ -104,7 +104,8 @@ Choose with `--mode`. Limit single accounts with `gmail-mcp-multi limit <alias> 
 | [Attachments](docs/attachments.md) | What can be read and the limits |
 | [Calendar](docs/calendar.md) | Turning it on, free-time search, events |
 | [Hosted mode](docs/hosted.md) | claude.ai web & mobile via Docker + Caddy |
-| [Security & privacy](docs/security.md) | Modes, encryption, audit log, prompt injection |
+| [Security & privacy](docs/security.md) | Modes, encryption, audit log, prompt injection, local files |
+| [Configuration](docs/configuration.md) | CLI commands, environment variables, files |
 | [Troubleshooting](docs/troubleshooting.md) | Common errors and fixes |
 | [Tool reference](docs/tools.md) | Every tool and parameter (generated) |
 | [Development](docs/development.md) | Architecture, tests, releasing |

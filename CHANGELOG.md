@@ -22,6 +22,31 @@ First release as **multi-gmail-account-mcp** (fork of dmorrill/gmail-mcp-multi).
 - Documentation in `docs/` (setup, usage, accounts, IMAP, attachments, Calendar, hosted mode, security, troubleshooting, development, generated tool reference).
 - Release workflow for npm and the MCP Registry.
 
+### Security (fixed before release, from an independent review)
+- **Labels:**
+  - Drafts mode can no longer trash or spam mail by applying system labels; Trash/Spam/Sent/Drafts are refused.
+  - IMAP refuses the matching folders.
+- **IMAP drafts:**
+  - `delete_draft` / `send_draft` only act on real drafts.
+  - A sent draft whose clean-up fails reports a warning instead of risking a second send.
+- **Query handling:**
+  - IMAP queries report the parts they can't apply.
+  - `bulk_cleanup` refuses such queries, and asks you directly through MCP elicitation when the client supports it.
+- **Local files:** reading and writing is limited to allowed folders (no hidden, app-data/startup, config, system or network paths). Hosted mode has no local file access.
+- **Unsubscribe:** the one-click check is now DNS-rebinding-safe, and mailto unsubscribes are limited to one address with a fixed body.
+- **Attachments:** reading runs in a worker thread with time and memory limits. Parsers are linear-time; the ODS expansion is capped.
+- **Hosted mode:**
+  - sign-out works across processes; changing the password signs everyone out
+  - lockout is per IP / IPv6 /64, with no global lock-out of the owner
+  - unused OAuth clients are evicted
+  - refresh tokens have a grace window
+  - one shared mail connection pool
+  - stricter redirect-prefix matching
+- **Encryption key:** never replaced while encrypted logins exist; key fingerprints in envelopes.
+- **Gmail:** search pages beyond 500 results.
+- **Reply-all:** works with group addresses (`undisclosed-recipients:;`).
+- **Calendar:** times are parsed in the configured time zone; calendar tools appear without a restart.
+
 ### Changed
 - Internals rebuilt around a provider layer (`MailProvider`) so every tool works for Gmail and IMAP.
 - Package renamed to `multi-gmail-account-mcp`. The `gmail-mcp-multi` command still works.
