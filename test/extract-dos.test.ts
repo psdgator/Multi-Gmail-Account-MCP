@@ -157,17 +157,23 @@ describe("worker isolation (compiled build)", () => {
 
   it.runIf(haveDist)("stops an extraction that exceeds the memory cap", async () => {
     const { extractAttachment } = await load();
-    process.env.GMAIL_MCP_EXTRACT_MEMORY_MB = "32";
+    process.env.GMAIL_MCP_EXTRACT_MEMORY_MB = "16";
     const files = {
       "[Content_Types].xml": strToU8("<Types/>"),
       "xl/workbook.xml": strToU8('<workbook><sheets><sheet name="S" r:id="rId1"/></sheets></workbook>'),
       "xl/_rels/workbook.xml.rels": strToU8('<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>'),
-      "xl/sharedStrings.xml": strToU8(`<sst>${"<si><t>x</t></si>".repeat(1_300_000)}</sst>`),
+      // ~24 MB of XML (just under the 25 MB zip entry limit): far above a 16 MB heap everywhere.
+      "xl/sharedStrings.xml": strToU8(`<sst>${"<si><t>x</t></si>".repeat(1_400_000)}</sst>`),
       "xl/worksheets/sheet1.xml": strToU8("<worksheet><sheetData/></worksheet>"),
     };
-    const r = await extractAttachment(zipSync(files), "big.xlsx", "");
+    let r;
+    try {
+      r = await extractAttachment(zipSync(files), "big.xlsx", "");
+    } finally {
+      delete process.env.GMAIL_MCP_EXTRACT_MEMORY_MB;
+    }
     expect(r.kind).toBe("unsupported");
-    expect(r.note).toMatch(/memory limit 32 MB/);
+    expect(r.note).toMatch(/memory limit 16 MB/);
   }, 30000);
 
   it.runIf(haveDist)("nothing reaches stdout (MCP stdio safety)", () => {

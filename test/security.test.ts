@@ -51,6 +51,22 @@ describe("file path policy", () => {
     expect(() => checkPath(link, "read")).toThrow(/hidden/);
   });
 
+  it("an explicitly allowed folder inside AppData works, but hidden/config stay blocked", () => {
+    const work = path.join(home, "AppData", "Local", "Temp", "jobs");
+    fs.mkdirSync(path.join(work, ".secret"), { recursive: true });
+    fs.writeFileSync(path.join(work, "a.pdf"), "x");
+    fs.writeFileSync(path.join(work, ".secret", "k"), "x");
+    expect(() => checkPath(path.join(work, "a.pdf"), "read")).toThrow(/protected/);
+    process.env.GMAIL_MCP_ALLOWED_DIRS = work;
+    try {
+      expect(checkPath(path.join(work, "a.pdf"), "read")).toBe(path.join(work, "a.pdf"));
+      expect(() => checkPath(path.join(work, ".secret", "k"), "read")).toThrow(/hidden/);
+      expect(() => checkPath(path.join(home, "AppData", "Roaming", "x"), "write")).toThrow(/protected/);
+    } finally {
+      delete process.env.GMAIL_MCP_ALLOWED_DIRS;
+    }
+  });
+
   it("GMAIL_MCP_ALLOWED_DIRS adds folders outside home", () => {
     const extra = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gmm-extra-")));
     fs.writeFileSync(path.join(extra, "a.txt"), "x");

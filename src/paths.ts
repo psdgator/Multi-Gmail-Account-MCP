@@ -64,17 +64,21 @@ export function checkPath(input: string, mode: "read" | "write"): string {
   resolved = path.join(safeRealpath(existing), ...tail);
   const cmp = normalizeForCompare(resolved);
 
+  // Folders the user explicitly allowed (GMAIL_MCP_ALLOWED_DIRS) take precedence over the
+  // home-folder rules (e.g. a work folder under AppData); the home folder gets the full checks.
   const roots = allowedRoots();
-  const root = roots.find((r) => sameOrInside(cmp, normalizeForCompare(r)));
+  const home = roots[0];
+  const explicit = roots.slice(1).find((r) => sameOrInside(cmp, normalizeForCompare(r)));
+  const root = explicit ?? (sameOrInside(cmp, normalizeForCompare(home)) ? home : undefined);
   if (!root) {
     throw new PathPolicyError(
       `"${input}" is outside the folders this server may use (your home folder${process.env.GMAIL_MCP_ALLOWED_DIRS ? " and GMAIL_MCP_ALLOWED_DIRS" : ""}). Add folders with GMAIL_MCP_ALLOWED_DIRS.`
     );
   }
 
-  const deny = [configDir(), path.join(os.homedir(), "AppData"), path.join(os.homedir(), "Library"), "/proc", "/sys", "/dev", "/etc"].map((d) =>
-    normalizeForCompare(safeRealpath(d))
-  );
+  const alwaysDenied = [configDir(), "/proc", "/sys", "/dev", "/etc"];
+  const homeDenied = explicit ? [] : [path.join(os.homedir(), "AppData"), path.join(os.homedir(), "Library")];
+  const deny = [...alwaysDenied, ...homeDenied].map((d) => normalizeForCompare(safeRealpath(d)));
   if (deny.some((d) => sameOrInside(cmp, d))) {
     throw new PathPolicyError(`"${input}" is in a protected location (app data, system or this server's own config).`);
   }
