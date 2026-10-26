@@ -3,4 +3,5 @@
  * provider factories (providers/registry.ts) and CLI commands (index.ts extraCommands).
  * Keep one line per module so features can be added independently.
  */
-export {};
+import "./providers/imap.js";
+import "./cli/imap.js";
