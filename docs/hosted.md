@@ -49,7 +49,7 @@ Caddy gets the certificate automatically on first start. If `healthz` fails, che
 There is no browser on the server, so Gmail sign-in uses a copy-paste step:
 
 ```bash
-docker compose run --rm app auth urbanstickers urbanstickersgr@gmail.com --manual
+docker compose run --rm app auth shop you@gmail.com --manual
 ```
 
 1. Open the printed link on your own computer and approve access.

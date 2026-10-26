@@ -1,141 +1,123 @@
-# gmail-mcp-multi
+# Multi Gmail Account MCP
 
-A Gmail MCP server that works with **many Gmail accounts at once**.
+**Use all your mailboxes from Claude at once.** This MCP server connects any number of Gmail and IMAP accounts, so you can ask *"what's unread everywhere?"*, *"who am I supposed to get back to?"* or *"read the invoice the supplier sent to the shop inbox"*. Claude searches every mailbox together and tells you which account each email came from.
 
-- Tell Claude *which* mailbox to use by a friendly alias: "check the **urbanstickers** inbox", "draft a reply from **psdgator**".
-- Or ask across **all** of them: "what's unread in all my accounts?", "find every invoice from DHL this month". Results from every account are merged newest-first and tagged with the account they came from.
-- **Safe by default**: the default `drafts` mode can read, organize and write drafts, but **cannot send**. You review and send from Gmail.
+[![npm](https://img.shields.io/npm/v/multi-gmail-account-mcp)](https://www.npmjs.com/package/multi-gmail-account-mcp) [![CI](https://github.com/psdgator/Multi-Gmail-Account-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/psdgator/Multi-Gmail-Account-MCP/actions/workflows/ci.yml) ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
 
-> Fork of [dmorrill/gmail-mcp-multi](https://github.com/dmorrill/gmail-mcp-multi). Upstream's `main` was an unfinished scaffold (no login, several tools missing). This fork merges the open community PRs (#7, #9, #10, #11, #13, #14, #15), rewrites the server on the current MCP SDK and adds real multi-account features. Credits below.
+## Why this one
 
-## Tools
-
-| Tool | Mode | Accounts | What it does |
+| | This server | Claude's built-in Gmail | Typical Gmail MCPs |
 |---|---|---|---|
-| `list_accounts` | readonly | – | Connected accounts, default, sign-in status |
-| `authenticate` | readonly | one | Connect an account (opens Google sign-in in your browser) |
-| `set_default_account` | readonly | one | Default for single-account tools |
-| `search_emails` | readonly | **many** | Gmail query syntax; all accounts by default, merged and sorted |
-| `inbox_summary` | readonly | **many** | Unread counts per inbox + newest unread messages |
-| `read_email` | readonly | one | Clean text body (HTML converted), labels, attachment list |
-| `read_thread` | readonly | one | Whole conversation |
-| `list_labels` / `list_drafts` / `list_filters` | readonly | **many** | |
-| `save_attachment` | readonly | one | Save an attachment to a local folder |
-| `create_draft` | drafts | one | New mail or threaded reply / reply-all, send-as address, Gmail signature, attachments |
-| `delete_draft` | drafts | one | |
-| `modify_emails` | drafts | one | Mark read/unread, star, archive, move to Inbox, add/remove labels by **name** (bulk, up to 1000) |
-| `create_label` | drafts | one | |
-| `send_email` / `send_draft` | **full** | one | Send |
-| `trash_emails` | **full** | one | Move to Trash |
-| `create_filter` / `delete_filter` | **full** | one | Gmail filters |
+| Accounts | **Unlimited Gmail + IMAP** | 1 | Usually 1, or one per call |
+| Search all inboxes in one go | **Yes, merged and de-duplicated** | No | Rarely |
+| "Who's waiting for my reply?" across accounts | **Yes** | No | No |
+| Read PDFs, Word, Excel and images in attachments | **Yes** | Partly | Rarely |
+| Never sends unless you allow it | **Default (drafts mode)** | Asks per send | Usually sends freely |
+| Logins encrypted, audit log of every action | **Yes** | n/a | Rarely |
+| Works in claude.ai web & mobile | **Hosted mode** | Yes | Rarely |
 
-The `account` argument takes an alias, an email address, a list, or `"all"`. Leave it out and the multi-account tools use **every** account, while single-account tools use the default account. `read_email` and `read_thread` will even find the message in the right account if you leave `account` out.
+## Features
 
-### Modes
+- **Multi-account by design:**
+  - Name mailboxes with aliases (`shop`, `work`, `personal`).
+  - Search, summarize and triage all of them at once, or pick one.
+  - Copies of the same email in two accounts are shown once.
+- **Triage:**
+  - `needs_reply` finds conversations waiting on you, oldest first.
+  - `daily_digest` and the `/morning-digest` prompt give you a briefing.
+  - `/reply-queue` drafts answers one by one.
+- **Attachments:** read PDFs (page ranges, scanned pages), DOCX, XLSX, PPTX, ODT/ODS, RTF, CSV/HTML, `.eml` and ZIP without saving them, and let Claude look at images (OCR included, Greek too).
+- **Writing (as drafts):**
+  - threaded replies and reply-all
+  - forwards with the original attachments
+  - Gmail *Send mail as* addresses and signatures
+  - local file attachments
+- **Tidying:**
+  - newsletter report and unsubscribe
+  - bulk archive / mark read / label / trash, always with a preview
+  - labels and filters
+- **Calendar (optional):** events across all accounts, free time across every calendar, and creating events.
+- **IMAP:** any mailbox (Hetzner, cPanel, Fastmail…) sits next to Gmail, with the same search syntax.
+- **Safety:**
+  - three modes (`readonly`, `drafts` = never sends, `full`) plus per-account limits
+  - encrypted logins (OS keychain)
+  - an audit log
+  - refuses sign-ins from the wrong account
+  - retries for reads only
+- **Hosted mode:** run it on a small server with Docker and add it to claude.ai as a custom connector (OAuth 2.1, password-protected).
 
-| Mode | Google permission requested | Can do |
-|---|---|---|
-| `readonly` | `gmail.readonly` | search, read, list, save attachments |
-| `drafts` (default) | `gmail.modify` | + drafts, labels, read/unread, archive. **No sending.** |
-| `full` | `gmail.modify` + `gmail.settings.basic` | + send, trash, filters |
+33 tools in total. See the **[tool reference](docs/tools.md)**.
 
-Start the server with `--mode readonly|drafts|full` (or `GMAIL_MCP_MODE`). You can also cap a single account lower, for example to keep one mailbox read-only: `gmail-mcp-multi limit psdgator readonly`.
-
-> Google has no permission that allows drafts but blocks sending. In `drafts` mode the "never sends" guarantee comes from this server simply having no send tool, so keep the mode at `drafts` or `readonly` if that matters to you.
-
-## Setup
-
-Requires **Node.js 20.19+**.
-
-### 1. Install
-
-```bash
-git clone https://github.com/psdgator/Multi-Gmail-Account-MCP.git
-cd Multi-Gmail-Account-MCP
-npm install        # also builds dist/
-```
-
-> If your system has `NODE_ENV=production` set, npm skips the build tools. Use `npm install --include=dev` instead.
-
-### 2. Create a Google OAuth client (once)
-
-1. [Google Cloud Console](https://console.cloud.google.com/): create a project. Use a personal Gmail account as the owner if you might leave Google Workspace later.
-2. **APIs & Services → Library** → enable **Gmail API**.
-3. **Google Auth Platform → Branding/Audience**: User type **External**. Add your addresses as test users, then press **Publish app** (status "In production").
-   *If the app stays in "Testing", Google expires your logins every 7 days.* For personal use you'll see an "unverified app" warning once per account. Click *Advanced → Go to … (unsafe)*.
-4. **Clients → Create client → Desktop app** → download the JSON.
-5. Save it as `~/.gmail-mcp/oauth-keys.json` (Windows: `C:\Users\<you>\.gmail-mcp\oauth-keys.json`).
-
-Google Workspace accounts: the Workspace admin may need to allow the app under *Security → API controls → App access control*.
-
-### 3. Connect accounts
+## Quick start
 
 ```bash
-node dist/index.js auth urbanstickers urbanstickersgr@gmail.com
-node dist/index.js auth psdgator antony@psdgator.com
-node dist/index.js default urbanstickers
-node dist/index.js doctor          # checks the setup and every account
-npm run smoke                      # live read-only test through the MCP server (add -- --draft to test drafts)
+npm install -g multi-gmail-account-mcp
 ```
 
-Or, once the server is added to Claude, just say *"connect my work Gmail as 'work'"*. The `authenticate` tool opens the sign-in page for you.
+1. **Google OAuth client (once):** create a Google Cloud project, enable the Gmail API, set the app to *External* and *In production*, create a *Desktop app* client, and save its JSON as `~/.gmail-mcp/oauth-keys.json`. [Step-by-step guide](docs/setup.md#2-create-a-google-oauth-client-once).
+2. **Connect accounts:**
 
-### 4. Add to Claude
+   ```bash
+   gmail-mcp-multi auth shop shop@gmail.com
+   gmail-mcp-multi auth work me@company.com --calendar
+   gmail-mcp-multi add-imap company me@mydomain.com --host mail.example.com   # optional IMAP mailbox
+   gmail-mcp-multi default shop
+   gmail-mcp-multi doctor
+   ```
 
-**Claude desktop app** (`claude_desktop_config.json`, *Settings → Developer → Edit Config*):
+3. **Add to Claude Desktop** (*Settings → Developer → Edit Config*), then restart Claude:
 
-```json
-{
-  "mcpServers": {
-    "gmail-multi": {
-      "command": "node",
-      "args": ["C:\\Users\\you\\projects\\gmail-mcp-multi\\dist\\index.js", "--mode", "drafts"]
-    }
-  }
-}
-```
+   ```json
+   {
+     "mcpServers": {
+       "gmail-multi": { "command": "npx", "args": ["-y", "multi-gmail-account-mcp", "--mode", "drafts"] }
+     }
+   }
+   ```
 
-**Claude Code**:
+   Claude Code: `claude mcp add gmail-multi -- npx -y multi-gmail-account-mcp --mode drafts`
 
-```bash
-claude mcp add gmail-multi -- node /path/to/gmail-mcp-multi/dist/index.js --mode drafts
-```
+4. **Ask Claude:**
+   - *Morning briefing.* (or `/morning-digest`)
+   - *Who am I supposed to get back to?*
+   - *Find the DHL invoices from October in all accounts and read the totals.*
+   - *Draft a reply to Maria in Greek saying the order ships Thursday.*
 
-## Files
+## Modes
 
-```
-~/.gmail-mcp/                 (override with GMAIL_MCP_HOME)
-├── config.json               accounts, aliases, default, per-account limits
-├── oauth-keys.json           your Google OAuth client
-└── accounts/<alias>/
-    ├── credentials.json      refresh token (owner-only permissions)
-    └── oauth-keys.json       optional per-account OAuth client
-```
+| Mode | Claude can |
+|---|---|
+| `readonly` | search, read, summarize, read attachments |
+| `drafts` *(default)* | the above, plus drafts, forwards as drafts, labels, read/unread, archive, and bulk archive with preview. **Nothing is ever sent.** |
+| `full` | the above, plus send, trash, unsubscribe, filters, and create calendar events |
 
-To remove an account: `node dist/index.js remove <alias>`. You can also revoke access at <https://myaccount.google.com/permissions>.
+Choose with `--mode`. Limit single accounts with `gmail-mcp-multi limit <alias> readonly`. Details: [Security](docs/security.md).
 
-## Development
+## Documentation
 
-```bash
-npm run build
-npm test      # unit tests + end-to-end tests against a fake Gmail API (no real mail touched)
-```
-
-`GMAIL_MCP_API_ROOT` points the server at another Gmail-compatible endpoint (used by the tests); `GMAIL_MCP_NO_BROWSER=1` stops it from opening a browser.
-
-## Roadmap
-
-- Remote (HTTP) mode so the same server can be added as a custom connector in Claude on the web and mobile
-- Batch API for faster large searches; attachment text extraction (PDF/DOCX)
-- Unified "daily digest" prompt across accounts
+| | |
+|---|---|
+| [Setup](docs/setup.md) | Install, Google Cloud, connecting accounts, Claude Desktop/Code |
+| [Everyday use](docs/usage.md) | What to ask Claude, by task |
+| [Accounts](docs/accounts.md) | Aliases, defaults, multi-account behaviour, per-account limits |
+| [IMAP accounts](docs/imap.md) | Non-Gmail mailboxes (Hetzner, cPanel…) |
+| [Attachments](docs/attachments.md) | What can be read and the limits |
+| [Calendar](docs/calendar.md) | Turning it on, free-time search, events |
+| [Hosted mode](docs/hosted.md) | claude.ai web & mobile via Docker + Caddy |
+| [Security & privacy](docs/security.md) | Modes, encryption, audit log, prompt injection |
+| [Troubleshooting](docs/troubleshooting.md) | Common errors and fixes |
+| [Tool reference](docs/tools.md) | Every tool and parameter (generated) |
+| [Development](docs/development.md) | Architecture, tests, releasing |
 
 ## Credits
 
-- Original project and scaffold: **Elle Morrill** (dmorrill/gmail-mcp-multi)
-- Secure credential storage, install docs: **Dave Moudy** (PR #15)
-- Per-account OAuth clients, standalone auth, read-only switch: **Vadim Zaliva** (PR #13)
-- Attachments, RFC 2047 subjects, labels and filters: **Bobby Marko** (PRs #9, #10, #11)
-- Attachment download: PR #14
-- Multi-account fan-out, modes, drafts/replies, rewrite: **Antonis Papamichail** ([psdgator](https://github.com/psdgator/Multi-Gmail-Account-MCP))
+Forked from [dmorrill/gmail-mcp-multi](https://github.com/dmorrill/gmail-mcp-multi) by **Elle Morrill**. This fork merged the upstream community pull requests:
 
-MIT licensed.
+- **Dave Moudy:** secure credential files, install docs (#15)
+- **Vadim Zaliva:** per-account OAuth clients, standalone auth, read-only switch (#13)
+- **Bobby Marko:** attachments, RFC 2047 subjects, labels and filters (#9, #10, #11)
+- attachment download (#14)
+
+Maintained by **Antonis Papamichail** ([psdgator](https://github.com/psdgator)). Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+MIT licensed. Privacy: [PRIVACY.md](PRIVACY.md).

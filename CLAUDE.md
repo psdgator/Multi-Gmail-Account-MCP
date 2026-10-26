@@ -1,24 +1,18 @@
-# gmail-mcp-multi: notes for AI-assisted development
+# Multi Gmail Account MCP: notes for AI-assisted development
 
-## What this is
-A local (stdio) MCP server giving Claude access to several Gmail accounts at once. Accounts have aliases; multi-account tools fan out in parallel and merge results tagged by account.
-
-## Layout
-- `src/index.ts`: CLI (`serve` default, `auth`, `accounts`, `doctor`, `default`, `limit`, `remove`)
-- `src/server.ts`: builds the McpServer, registers tools, writes server instructions listing accounts
-- `src/config.ts`: modes (readonly < drafts < full), config dir, owner-only file writes
-- `src/accounts.ts`: config.json, alias/email resolution (`resolve(arg, allowMany)`), credentials paths
-- `src/oauth.ts`: scopes per mode, loopback OAuth flow (127.0.0.1, PKCE, state), browser opening
-- `src/gmail.ts`: cached Gmail clients per account, token refresh persistence, `fanOut`, error translation
-- `src/mime.ts`: RFC 5322/MIME builder (RFC 2047 headers, RFC 2231 filenames, base64 bodies)
-- `src/message.ts`: Gmail payload → clean message (charset-aware decoding, html→text, attachments)
-- `src/tools/*`: tool definitions; each declares `minMode` and is only registered if the server mode allows it
+MCP server giving Claude access to many Gmail and IMAP accounts at once (aliases, merged search, triage, attachments, Calendar, hosted mode). Full architecture: docs/development.md.
 
 ## Rules
-- Never add a tool that sends mail without `minMode: "full"`.
-- Every tool touching one mailbox calls `ctx.accounts.resolve(arg, false)` and `requireMode` for writes.
-- Multi-account tools must use `ctx.gmail.fanOut` and return per-account `errors` instead of failing.
-- Nothing may print to stdout in server mode (stdio transport); log to stderr.
+- Tools talk to `MailProvider` (src/providers/types.ts) via `ctx.mail`. Never call Gmail/IMAP directly from a tool. Gmail-only features go through `ctx.mail.gmail(acc)`.
+- Multi-account tools: `ctx.accounts.resolve(arg, true)` + `ctx.mail.fanOut()`. Return per-account `errors`, don't fail the whole call; merge messages with `mergeAndDedupe()`.
+- Every tool declares `minMode`. Nothing that sends, trashes, unsubscribes or creates filters/events may be below `full`. Write tools call `requireMode` for per-account limits.
+- Bulk changes need a preview + confirm token (see `bulk_cleanup`).
+- Never log email bodies or secrets (audit `redact` drops body/html/note/text/password/content/data).
+- Nothing may print to stdout in stdio server mode; log to stderr.
+- "Not found" errors from providers must start with `Not found` (read tools fall through to the next account).
+- Keep docs in sync: `npm run docs` regenerates docs/tools.md; update CHANGELOG.md.
 
-## Test
-`npm test` builds, then runs unit tests and e2e tests (`test/e2e.test.ts`) that spawn the real server against `test/fake-gmail.ts`.
+## Commands
+- `npm test`: build + all tests offline (fake Gmail in test/fake-gmail.ts, in-memory IMAP/SMTP, HTTP OAuth). Tests never touch the OS keychain.
+- `npm run smoke`: live read-only test against your real connected accounts.
+- On Windows with `NODE_ENV=production`: `npm install --include=dev`.

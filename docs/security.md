@@ -67,7 +67,7 @@ Every tool call is appended to `~/.gmail-mcp/audit.log` (JSON lines; rotated at 
 
 ## Hosted mode
 
-Running the server on the internet for claude.ai has a different threat model: anyone who can reach the URL can try to log in. Hosted mode requires its own OAuth login with a strong password, rate limiting, and HTTPS. See [Hosted mode → Security](hosted.md#security).
+Running the server on the internet for claude.ai has a different threat model: anyone who can reach the URL can try to log in. Hosted mode requires its own OAuth login with a strong password, rate limiting, and HTTPS. See [Hosted mode → Security](hosted.md#security-model).
 
 ## Revoking access
 

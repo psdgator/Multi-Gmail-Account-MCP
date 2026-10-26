@@ -2,7 +2,7 @@
 #   cp deploy/env.example .env   # fill in the values
 #   mkdir -p secrets && cp ~/Downloads/client_secret_*.json secrets/oauth-keys.json
 #   docker compose up -d --build
-#   docker compose run --rm app auth urbanstickers you@gmail.com --manual
+#   docker compose run --rm app auth shop you@gmail.com --manual
 services:
   app:
     build: .
