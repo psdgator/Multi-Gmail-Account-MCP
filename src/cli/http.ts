@@ -87,15 +87,10 @@ extraCommands["http-logout"] = {
     const alsoClients = bool(args, "--clients");
     const accounts = new AccountManager();
     const store = new AuthStore(accounts.root, accounts.secrets);
-    let before: { clients: number } | undefined;
-    try {
-      before = store.stats();
-    } catch {
-      /* unreadable: revokeAll replaces it */
-    }
+    // One locked read-modify-write: a save by the running server can't undo it.
     const r = store.revokeAll(alsoClients);
     if (r.replacedUnreadable) console.log(`${store.file} could not be read; replaced it with an empty one (all tokens and clients are gone).`);
-    else console.log(`Revoked ${r.tokens} tokens${alsoClients ? ` and ${r.clients} registered clients` : ""} (had ${before?.clients ?? 0} clients).`);
+    else console.log(`Revoked ${r.tokens} tokens${alsoClients ? ` and ${r.clients} registered clients` : ""} (had ${r.clientsBefore} clients).`);
     console.log("A running server picks this up immediately; no restart needed.");
     console.log("Connected apps (e.g. claude.ai) must connect again and enter the server password.");
   },

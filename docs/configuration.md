@@ -78,6 +78,7 @@ oauth-keys.json                  your Google OAuth client
 master.key                       encryption key (only when there is no OS keychain)
 audit.log, audit.log.1           action log (JSON lines)
 http-auth.json                   hosted mode: OAuth clients and hashed tokens (encrypted)
+http-auth.json.lock              hosted mode: exists only while http-auth.json is being changed
 accounts/<alias>/credentials.json    encrypted login (OAuth tokens or IMAP password)
 accounts/<alias>/oauth-keys.json     optional per-account Google OAuth client
 ```
