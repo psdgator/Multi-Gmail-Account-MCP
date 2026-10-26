@@ -66,7 +66,7 @@ First release as **multi-gmail-account-mcp** (fork of dmorrill/gmail-mcp-multi).
   - one shared mail connection pool
   - stricter redirect-prefix matching
 - **Encryption key:** never replaced while encrypted logins exist; key fingerprints in envelopes.
-- **Gmail:** search pages beyond 500 results.
+- **Gmail:** search pages beyond 500 results; per-minute quota errors get a clear "wait a minute" message.
 - **Reply-all:** works with group addresses (`undisclosed-recipients:;`).
 - **Calendar:** times are parsed in the configured time zone; "tomorrow" and day ranges are correct across daylight-saving changes, including zones where midnight is skipped; skipped times move forward; calendar tools appear without a restart.
 

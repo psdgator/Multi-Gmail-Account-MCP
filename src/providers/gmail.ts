@@ -61,6 +61,10 @@ export function explainGoogleError(alias: string, err: unknown): Error {
         `(If this happens every 7 days, your Google Cloud OAuth app is still in "Testing"; set it to "In production".)`
     );
   }
+  // Google reports per-user quota as 403 or 429 ("Quota exceeded … per minute per user", "rateLimitExceeded").
+  if ((status === 403 || status === 429) && /quota exceeded|rate ?limit/i.test(msg)) {
+    return new Error(`Gmail's per-minute limit was reached for "${alias}" (too many requests in a short time). Wait a minute and try again.`);
+  }
   if (status === 403 && /insufficient|scope|permission/i.test(msg)) {
     return new Error(
       `"${alias}" was connected with fewer permissions than this action needs. Re-run authenticate for "${alias}" with a higher mode (or with calendar access).`

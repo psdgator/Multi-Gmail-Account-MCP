@@ -315,3 +315,14 @@ describe("send_draft", () => {
     await client.close();
   });
 });
+
+describe("Google error messages", () => {
+  it("per-user quota errors (403 or 429) say to wait a minute", async () => {
+    const { explainGoogleError } = await import("../src/providers/gmail.js");
+    const quota = "Quota exceeded for quota metric 'Total Query Cost' and limit 'Units per minute per user' of service 'gmail.googleapis.com'";
+    for (const status of [403, 429]) {
+      expect(explainGoogleError("shop", { message: quota, response: { status } }).message).toMatch(/per-minute limit.*"shop".*Wait a minute/);
+    }
+    expect(explainGoogleError("shop", { message: "Request had insufficient authentication scopes.", response: { status: 403 } }).message).toMatch(/fewer permissions/);
+  });
+});
