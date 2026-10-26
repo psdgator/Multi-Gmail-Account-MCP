@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+  <title>Multi Gmail Account MCP</title>
+  <rect width="240" height="240" rx="52" fill="#16204A"/>
+  <g transform="translate(0 22)">
+    <!-- three mailboxes, fanned from one pivot like a hand of cards -->
+    <g transform="rotate(-24 120 214)">
+      <rect x="66" y="58" width="108" height="76" rx="9" fill="#D9A86C" stroke="#16204A" stroke-width="5"/>
+      <path d="M73 66 L120 101 L167 66" fill="none" stroke="#16204A" stroke-width="6" stroke-linejoin="round" stroke-linecap="round" opacity=".45"/>
+    </g>
+    <g transform="rotate(24 120 214)">
+      <rect x="66" y="58" width="108" height="76" rx="9" fill="#8FB3EA" stroke="#16204A" stroke-width="5"/>
+      <path d="M73 66 L120 101 L167 66" fill="none" stroke="#16204A" stroke-width="6" stroke-linejoin="round" stroke-linecap="round" opacity=".45"/>
+    </g>
+    <rect x="62" y="70" width="116" height="82" rx="10" fill="#F4F6FB" stroke="#16204A" stroke-width="5"/>
+    <path d="M70 79 L120 117 L170 79" fill="none" stroke="#16204A" stroke-width="7" stroke-linejoin="round" stroke-linecap="round"/>
+    <!-- unread badge -->
+    <circle cx="176" cy="72" r="17" fill="#E23D2E" stroke="#16204A" stroke-width="5"/>
+  </g>
+</svg>

@@ -1,8 +1,12 @@
+<img src="docs/images/logo.svg" width="88" alt="Multi Gmail Account MCP logo">
+
 # Multi Gmail Account MCP
 
 **Use all your mailboxes from Claude at once.** This MCP server connects any number of Gmail and IMAP accounts, so you can ask *"what's unread everywhere?"*, *"who am I supposed to get back to?"* or *"read the invoice the supplier sent to the shop inbox"*. Claude searches every mailbox together and tells you which account each email came from.
 
 [![npm](https://img.shields.io/npm/v/multi-gmail-account-mcp)](https://www.npmjs.com/package/multi-gmail-account-mcp) [![CI](https://github.com/psdgator/Multi-Gmail-Account-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/psdgator/Multi-Gmail-Account-MCP/actions/workflows/ci.yml) ![License: MIT](https://img.shields.io/badge/license-MIT-blue)
+
+![Claude answering "What's unread everywhere?" with emails from three accounts, each tagged shop, agency or personal](docs/images/gallery-2-unread-everywhere.png)
 
 ## Why this one
 
@@ -47,6 +51,15 @@
 - **Hosted mode:** run it on a small server with Docker and add it to claude.ai as a custom connector (OAuth 2.1, password-protected).
 
 33 tools in total. See the **[tool reference](docs/tools.md)**.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Who am I supposed to get back to: conversations waiting for a reply across accounts](docs/images/gallery-3-needs-reply.png) | ![Reading the total, VAT and due date from a PDF invoice attachment](docs/images/gallery-4-attachments.png) |
+| **Needs reply:** everyone waiting on you, in every inbox, oldest first. | **Attachments:** ask about what's inside PDFs, Office files and images. |
+| ![Drafts mode: replies are saved as drafts, nothing is sent](docs/images/gallery-5-drafts-only.png) | ![Every inbox, one conversation](docs/images/gallery-1-overview.png) |
+| **Drafts only by default:** nothing is sent or deleted unless you switch to full mode. | **Gmail and IMAP side by side**, each with its own name. |
 
 ## Quick start
 
