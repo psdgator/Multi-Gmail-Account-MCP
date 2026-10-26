@@ -20,9 +20,12 @@ import { AuthStore } from "./auth-store.js";
  * - Clients register dynamically (claude.ai does this), but only with redirect
  *   URIs on the allow-list (Claude's callback and loopback by default).
  * - The authorization step shows a page asking for the server's access
- *   password (GMAIL_MCP_HTTP_PASSWORD). Wrong passwords lock out the offending
- *   IP (IPv6: its /64) with exponential backoff; many failures overall only add
- *   a short delay, so the owner is never locked out by other people's attempts.
+ *   password (GMAIL_MCP_HTTP_PASSWORD). Every password check ends the sign-in
+ *   request, right or wrong (another guess needs a new /authorize). Checks are
+ *   serialized server-wide with a minimum duration each, which caps the global
+ *   guess rate. Wrong passwords lock out the offending IP (IPv6: its /64, and its
+ *   /48 after many /64s failed) with exponential backoff; there is no global lock,
+ *   so the owner is never locked out by other people's attempts.
  * - Codes are single-use and live 5 minutes; PKCE S256 is enforced by the SDK.
  * - Access tokens (1 h) and rotating refresh tokens (30 d) are random 256-bit
  *   strings stored only as hashes; reusing a rotated refresh token revokes the
@@ -46,11 +49,18 @@ export interface ProviderOptions {
   refreshTtlMs?: number;
   /** Rotated refresh tokens are still accepted this long (default 60 s). */
   refreshReuseGraceMs?: number;
+  /** Registered clients kept at most (default 500). */
   maxClients?: number;
-  /** Unused clients younger than this are never evicted to make room (default 10 min). */
+  /** Never-used clients younger than this are not evicted to make room (default 30 s). */
   clientEvictMinAgeMs?: number;
-  /** Extra delay on every wrong password (default 400 ms). */
-  failureDelayMs?: number;
+  /** Clients without live tokens and no token issued for this long can be evicted (default 90 days). */
+  clientInactiveMs?: number;
+  /** Minimum duration of every password check; checks run one at a time server-wide (default 400 ms). */
+  attemptMinMs?: number;
+  /** Password checks allowed to wait in line; more are answered 429 at once (default 20). */
+  attemptQueueMax?: number;
+  /** Open sign-in requests kept at most; the oldest are dropped (default 5000). */
+  maxPending?: number;
   limiter?: LoginLimiter;
   /** Shown on the login page. */
   serverName?: string;
@@ -114,82 +124,165 @@ export function ipKey(ip: string): string {
   return a;
 }
 
+/** The IPv6 /48 an address belongs to (one site; several /64s), or undefined for IPv4. */
+export function ipPrefix48(ip: string): string | undefined {
+  const a = ip.trim();
+  if (/^::ffff:/i.test(a) && net.isIPv4(a.slice(7))) return undefined;
+  if (!net.isIPv6(a.split("%")[0])) return undefined;
+  return `${ipv6Groups(a).slice(0, 3).join(":")}::/48`;
+}
+
 export interface LoginLimiterOptions {
-  /** Wrong passwords (per IP / IPv6 /64) within the window before a lock. */
+  /** Wrong passwords per IP (IPv6: per /64) within the window before that address is locked. */
   maxPerKey: number;
+  /** Wrong passwords per IPv6 /48 within the window before the whole /48 is locked. */
+  maxPerPrefix: number;
   windowMs: number;
   /** First lock duration; doubles with every further lock, up to maxLockMs. */
   baseLockMs: number;
   maxLockMs: number;
-  /** Failures (all sources, within the window) before the soft global delay starts. */
-  globalSoftThreshold: number;
-  /** Cap of the soft global delay added to each attempt. */
-  globalMaxDelayMs: number;
+  /** Addresses/networks remembered at most; the least recently seen are forgotten first. */
+  maxEntries: number;
 }
 
 const LIMITER_DEFAULTS: LoginLimiterOptions = {
   maxPerKey: 5,
+  maxPerPrefix: 50,
   windowMs: 15 * 60_000,
   baseLockMs: 5 * 60_000,
   maxLockMs: 60 * 60_000,
-  globalSoftThreshold: 20,
-  globalMaxDelayMs: 2000,
+  maxEntries: 10_000,
 };
 
+const DAY_MS = 24 * 3600_000;
+
+interface LimiterEntry {
+  fails: number;
+  first: number;
+  lockedUntil: number;
+  locks: number;
+  last: number;
+}
+
 /**
- * Brute-force protection for the password form.
+ * Per-network lockout for the password form.
  *
- * Locks are per IP (IPv6 per /64) with exponential backoff. There is no global
- * lock: failures from many sources only add a bounded delay to every attempt, so
- * the correct password from the owner's address is never refused.
+ * Locks are per IPv4 address or IPv6 /64, with exponential backoff; many
+ * failures from different /64s of one IPv6 /48 lock that /48 as well. There is
+ * no global lock, so the owner's correct password from another network is never
+ * refused because of someone else's failures (the global guess rate is bounded
+ * separately by AttemptQueue). Memory is bounded: expired entries are dropped
+ * and at most `maxEntries` are kept.
  */
 export class LoginLimiter {
-  private perKey = new Map<string, { fails: number; first: number; lockedUntil: number; locks: number; last: number }>();
-  private globalFails: number[] = [];
+  /** Map order = least recently failed first (entries are re-inserted on every failure). */
+  private entries = new Map<string, LimiterEntry>();
+  private lastPrune = 0;
   readonly o: LoginLimiterOptions;
 
   constructor(opts: Partial<LoginLimiterOptions> = {}) {
     this.o = { ...LIMITER_DEFAULTS, ...opts };
   }
 
-  lockedFor(ip: string): number {
-    const e = this.perKey.get(ipKey(ip));
-    const now = Date.now();
-    return e && e.lockedUntil > now ? e.lockedUntil - now : 0;
+  private keys(ip: string): { key: string; max: number }[] {
+    const out = [{ key: ipKey(ip), max: this.o.maxPerKey }];
+    const prefix = ipPrefix48(ip);
+    if (prefix) out.push({ key: prefix, max: this.o.maxPerPrefix });
+    return out;
   }
 
-  /** Soft delay to add to every attempt while many failures are happening overall. */
-  globalDelayMs(): number {
+  /** How long (ms) this address is still locked out; 0 = not locked. */
+  lockedFor(ip: string): number {
     const now = Date.now();
-    while (this.globalFails.length && now - this.globalFails[0] > this.o.windowMs) this.globalFails.shift();
-    const over = this.globalFails.length - this.o.globalSoftThreshold;
-    return over > 0 ? Math.min(this.o.globalMaxDelayMs, over * 100) : 0;
+    let ms = 0;
+    for (const { key } of this.keys(ip)) {
+      const e = this.entries.get(key);
+      if (e && e.lockedUntil > now) ms = Math.max(ms, e.lockedUntil - now);
+    }
+    return ms;
   }
 
   fail(ip: string): void {
     const now = Date.now();
-    const key = ipKey(ip);
-    const e = this.perKey.get(key) ?? { fails: 0, first: now, lockedUntil: 0, locks: 0, last: now };
-    if (now - e.last > 24 * 3600_000) e.locks = 0; // a quiet day forgets earlier locks
-    if (now - e.first > this.o.windowMs) Object.assign(e, { fails: 0, first: now });
-    e.fails++;
-    e.last = now;
-    if (e.fails >= this.o.maxPerKey) {
-      e.lockedUntil = now + Math.min(this.o.maxLockMs, this.o.baseLockMs * 2 ** e.locks);
-      e.locks++;
-      e.fails = 0;
-      e.first = now;
+    for (const { key, max } of this.keys(ip)) {
+      const e = this.entries.get(key) ?? { fails: 0, first: now, lockedUntil: 0, locks: 0, last: now };
+      if (now - e.last > DAY_MS) e.locks = 0; // a quiet day forgets earlier locks
+      if (now - e.first > this.o.windowMs) Object.assign(e, { fails: 0, first: now });
+      e.fails++;
+      e.last = now;
+      if (e.fails >= max) {
+        e.lockedUntil = now + Math.min(this.o.maxLockMs, this.o.baseLockMs * 2 ** e.locks);
+        e.locks++;
+        e.fails = 0;
+        e.first = now;
+      }
+      this.entries.delete(key);
+      this.entries.set(key, e);
     }
-    this.perKey.set(key, e);
-    this.globalFails.push(now);
-    if (this.globalFails.length > 10_000) this.globalFails.splice(0, this.globalFails.length - 10_000);
-    if (this.perKey.size > 10_000) {
-      for (const [k, v] of this.perKey) if (v.lockedUntil <= now && now - v.last > this.o.windowMs) this.perKey.delete(k);
-    }
+    this.prune(now);
   }
 
   succeed(ip: string): void {
-    this.perKey.delete(ipKey(ip));
+    this.entries.delete(ipKey(ip));
+  }
+
+  /** Number of remembered addresses/networks. */
+  get size(): number {
+    return this.entries.size;
+  }
+
+  private prune(now: number): void {
+    if (now - this.lastPrune >= 60_000) {
+      this.lastPrune = now;
+      for (const [k, e] of this.entries) {
+        // Lock history is kept for a day (for the backoff), plain failures for the window.
+        if (e.lockedUntil <= now && now - e.last > (e.locks > 0 ? DAY_MS : this.o.windowMs)) this.entries.delete(k);
+      }
+    }
+    while (this.entries.size > this.o.maxEntries) this.entries.delete(this.entries.keys().next().value!);
+  }
+}
+
+/**
+ * Serializes password checks server-wide: one at a time, each taking at least
+ * `minMs`, so at most 1000/minMs guesses per second are possible no matter how
+ * many addresses or parallel connections are used. At most `maxQueue` attempts
+ * may wait (including the one being checked); beyond that, `run` returns
+ * undefined at once and nothing is checked.
+ */
+export class AttemptQueue {
+  private tail: Promise<unknown> = Promise.resolve();
+  private queued = 0;
+
+  constructor(
+    readonly minMs = 400,
+    readonly maxQueue = 20
+  ) {}
+
+  get length(): number {
+    return this.queued;
+  }
+
+  /** Seconds until an attempt submitted now would be checked. */
+  retryAfterSec(): number {
+    return Math.max(1, Math.ceil((this.queued * this.minMs) / 1000));
+  }
+
+  run<T>(fn: () => T): Promise<T> | undefined {
+    if (this.queued >= this.maxQueue) return undefined;
+    this.queued++;
+    const turn = this.tail.then(async () => {
+      const started = Date.now();
+      try {
+        return fn();
+      } finally {
+        const left = this.minMs - (Date.now() - started);
+        if (left > 0) await new Promise((r) => setTimeout(r, left));
+        this.queued--;
+      }
+    });
+    this.tail = turn.catch(() => undefined);
+    return turn;
   }
 }
 
@@ -197,6 +290,7 @@ export class PasswordOAuthProvider implements OAuthServerProvider {
   private pending = new Map<string, Pending>();
   private codes = new Map<string, CodeRecord>();
   readonly limiter: LoginLimiter;
+  readonly attempts: AttemptQueue;
   private readonly accessTtlMs: number;
   private readonly refreshTtlMs: number;
 
@@ -204,7 +298,14 @@ export class PasswordOAuthProvider implements OAuthServerProvider {
     this.accessTtlMs = opts.accessTtlMs ?? 60 * 60_000;
     this.refreshTtlMs = opts.refreshTtlMs ?? 30 * 24 * 3600_000;
     this.limiter = opts.limiter ?? new LoginLimiter();
+    this.attempts = new AttemptQueue(opts.attemptMinMs ?? 400, opts.attemptQueueMax ?? 20);
     setInterval(() => this.sweep(), 60_000).unref();
+  }
+
+  /** Clients between a correct password and their token request (never evicted). */
+  private clientsMidSignIn(): Set<string> {
+    const now = Date.now();
+    return new Set([...this.codes.values()].filter((c) => !c.used && c.expiresAt > now).map((c) => c.clientId));
   }
 
   private sweep(): void {
@@ -239,11 +340,15 @@ export class PasswordOAuthProvider implements OAuthServerProvider {
             `redirect_uri not allowed by this server: ${bad.join(", ") || "(none given)"}. Allowed: ${this.opts.allowedRedirects.join(", ")}${this.opts.allowLoopbackRedirects ? ", http://localhost/127.0.0.1 (any port)" : ""}`
           );
         }
-        const max = this.opts.maxClients ?? 100;
+        const max = this.opts.maxClients ?? 500;
         const count = this.opts.store.clientCount();
         if (count >= max) {
-          // Make room by dropping clients that registered but never completed a sign-in.
-          this.opts.store.evictUnusedClients(count - max + 1, this.opts.clientEvictMinAgeMs ?? 10 * 60_000);
+          // Make room: clients that never completed a sign-in first, then long-inactive ones without live tokens.
+          this.opts.store.evictClients(count - max + 1, {
+            unusedGraceMs: this.opts.clientEvictMinAgeMs ?? 30_000,
+            inactiveMs: this.opts.clientInactiveMs ?? 90 * DAY_MS,
+            keep: this.clientsMidSignIn(),
+          });
           if (this.opts.store.clientCount() >= max) {
             throw new InvalidClientMetadataError("Too many registered clients. Run `gmail-mcp-multi http-logout --clients` on the server.");
           }
@@ -262,6 +367,8 @@ export class PasswordOAuthProvider implements OAuthServerProvider {
     const id = crypto.randomBytes(24).toString("base64url");
     const csrf = crypto.randomBytes(24).toString("base64url");
     this.pending.set(id, { clientId: client.client_id, params, csrf, expiresAt: Date.now() + 10 * 60_000 });
+    const maxPending = this.opts.maxPending ?? 5000;
+    while (this.pending.size > maxPending) this.pending.delete(this.pending.keys().next().value!);
     this.renderLogin(res, { id, csrf, client, redirectUri: params.redirectUri });
   }
 
@@ -310,7 +417,7 @@ ${v.error ? `<p role="alert" style="color:#b91c1c;margin:0 0 12px">${escapeHtml(
 </form></body></html>`);
   }
 
-  private plainPage(res: Response, status: number, title: string, msg: string): void {
+  plainPage(res: Response, status: number, title: string, msg: string): void {
     this.securityHeaders(res);
     res.status(status).type("html").send(`<!doctype html><meta charset="utf-8"><title>${escapeHtml(title)}</title><body style="font-family:system-ui,sans-serif;padding:32px"><h1 style="font-size:20px">${escapeHtml(title)}</h1><p>${escapeHtml(msg)}</p></body>`);
   }
@@ -348,23 +455,43 @@ ${v.error ? `<p role="alert" style="color:#b91c1c;margin:0 0 12px">${escapeHtml(
         this.redirectWith(res, p.params.redirectUri, { error: "access_denied", error_description: "The user denied access", state: p.params.state });
         return;
       }
-      // Soft slowdown while many wrong passwords are arriving overall (never a refusal).
-      const slow = this.limiter.globalDelayMs();
-      if (slow > 0) await new Promise((r) => setTimeout(r, slow));
       const locked = this.limiter.lockedFor(ip);
       if (locked > 0) {
-        this.renderLogin(res, { id: body.request, csrf: p.csrf, client, redirectUri: p.params.redirectUri, status: 429, error: `Too many wrong passwords. Try again in ${Math.ceil(locked / 60_000)} minutes.` });
+        this.pending.delete(body.request);
+        this.lockedPage(res, locked);
         return;
       }
-      if (typeof body.password !== "string" || !passwordMatches(body.password, this.opts.password)) {
-        this.limiter.fail(ip);
-        const delay = this.opts.failureDelayMs ?? 400;
-        if (delay > 0) await new Promise((r) => setTimeout(r, delay));
-        this.renderLogin(res, { id: body.request, csrf: p.csrf, client, redirectUri: p.params.redirectUri, status: 401, error: "Wrong password." });
+      // Claim the request before checking: right or wrong, it can't be used for another guess.
+      const id = body.request;
+      this.pending.delete(id);
+      const turn = this.attempts.run((): { kind: "ok" | "wrong" } | { kind: "locked"; ms: number } => {
+        // Re-checked in line: parallel attempts from one network stop at its limit.
+        const lockedNow = this.limiter.lockedFor(ip);
+        if (lockedNow > 0) return { kind: "locked", ms: lockedNow };
+        if (typeof body.password !== "string" || !passwordMatches(body.password, this.opts.password)) {
+          this.limiter.fail(ip);
+          return { kind: "wrong" };
+        }
+        this.limiter.succeed(ip);
+        return { kind: "ok" };
+      });
+      if (!turn) {
+        // Too many attempts waiting: nothing was checked, so the form stays valid.
+        this.pending.set(id, p);
+        const wait = this.attempts.retryAfterSec();
+        res.setHeader("Retry-After", String(wait));
+        this.renderLogin(res, { id, csrf: p.csrf, client, redirectUri: p.params.redirectUri, status: 429, error: `The server is busy with other sign-in attempts. Wait ${wait} seconds, then enter the password again.` });
         return;
       }
-      this.limiter.succeed(ip);
-      this.pending.delete(body.request);
+      const result = await turn;
+      if (result.kind === "locked") {
+        this.lockedPage(res, result.ms);
+        return;
+      }
+      if (result.kind === "wrong") {
+        this.plainPage(res, 401, "Wrong password", "The password was wrong, so this sign-in request was cancelled. Start the connection again from your app.");
+        return;
+      }
       const code = crypto.randomBytes(32).toString("base64url");
       this.codes.set(code, {
         clientId: client.client_id,
@@ -377,6 +504,11 @@ ${v.error ? `<p role="alert" style="color:#b91c1c;margin:0 0 12px">${escapeHtml(
       this.redirectWith(res, p.params.redirectUri, { code, state: p.params.state });
     });
     return router;
+  }
+
+  private lockedPage(res: Response, ms: number): void {
+    res.setHeader("Retry-After", String(Math.ceil(ms / 1000)));
+    this.plainPage(res, 429, "Too many wrong passwords", `Too many wrong passwords from your network. Try again in ${Math.ceil(ms / 60_000)} minutes, then start the connection again from your app.`);
   }
 
   // ---- token endpoint ----
@@ -403,11 +535,12 @@ ${v.error ? `<p role="alert" style="color:#b91c1c;margin:0 0 12px">${escapeHtml(
     }
     if (redirectUri !== undefined && redirectUri !== rec.redirectUri) throw new InvalidGrantError("redirect_uri does not match");
     if (resource && normalizeResource(resource) !== normalizeResource(this.opts.resource)) throw new InvalidTargetError("Wrong resource");
-    rec.used = true;
     const t = this.opts.store.issue(
       { clientId: client.client_id, scopes: rec.scopes, resource: normalizeResource(this.opts.resource) },
       { accessMs: this.accessTtlMs, refreshMs: this.refreshTtlMs }
     );
+    // Marked only once tokens exist: if saving failed, the code can be retried.
+    rec.used = true;
     rec.family = t.family;
     return { access_token: t.access, token_type: "bearer", expires_in: t.expiresInSec, refresh_token: t.refresh, ...(rec.scopes.length ? { scope: rec.scopes.join(" ") } : {}) };
   }

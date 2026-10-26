@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { ensureSecureDir } from "../config.js";
 import type { SecretStore } from "../secrets.js";
 
 /**
@@ -14,7 +15,13 @@ import type { SecretStore } from "../secrets.js";
  * The file is the source of truth. Every operation first re-reads it when it
  * changed on disk (e.g. `gmail-mcp-multi http-logout` run from another
  * process), so a running server never keeps honouring revoked tokens and never
- * writes them back from a stale in-memory copy.
+ * writes them back from a stale in-memory copy:
+ *   - if the changed file can't be read (damaged, wrong key), every operation
+ *     fails with an AuthStoreError until it can be read again; nothing is
+ *     answered from, or written back from, the old in-memory copy;
+ *   - a save is refused if the file changed since it was read;
+ *   - writes go to a temporary file that is then renamed over the old one, so
+ *     readers never see a half-written file.
  */
 
 export interface TokenRecord {
@@ -56,8 +63,27 @@ interface StoreData {
   rotated: Record<string, RotatedRecord>;
   /** clientId -> first time a token was issued to it (clients never used can be evicted). */
   tokenIssued: Record<string, number>;
+  /** clientId -> last time a token was issued to it (sign-in or refresh). */
+  lastActive: Record<string, number>;
   /** scrypt fingerprint of the access password the tokens were issued under (never the password itself). */
   password?: PasswordFingerprint;
+}
+
+export interface EvictOptions {
+  /** Never-used clients younger than this are kept (a sign-in may be in progress). */
+  unusedGraceMs: number;
+  /** Clients without live tokens whose last token was issued longer ago than this can go too. */
+  inactiveMs: number;
+  /** Clients that must not be evicted (e.g. holding an authorization code). */
+  keep?: ReadonlySet<string>;
+}
+
+/** The sign-in state file could not be read or written; the operation was not carried out. */
+export class AuthStoreError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuthStoreError";
+  }
 }
 
 export const hashToken = (t: string) => crypto.createHash("sha256").update(t, "utf8").digest("hex");
@@ -69,22 +95,45 @@ function fingerprint(password: string, salt: Buffer, params = SCRYPT): string {
   return crypto.scryptSync(password, salt, 32, { N: params.N, r: params.r, p: params.p, maxmem: 64 * 1024 * 1024 }).toString("base64");
 }
 
+const sleepSync = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+/** rename(), retried briefly: Windows refuses it while another process (antivirus, a reader) has the target open. */
+function renameWithRetry(from: string, to: string): void {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (attempt >= 5 || !["EPERM", "EACCES", "EBUSY"].includes(code ?? "")) throw err;
+      sleepSync(20 * (attempt + 1));
+    }
+  }
+}
+
 export class AuthStore {
   readonly file: string;
   private data: StoreData;
-  /** stat signature of the file as we last read/wrote it. */
+  /** stat signature of the file as we last read it ("" = re-read on next access). */
   private stamp = "";
+  /** Why the file on disk could not be read (set while it can't). */
+  private unreadable?: string;
 
   constructor(
     root: string,
     private readonly secrets: SecretStore
   ) {
     this.file = path.join(root, "http-auth.json");
-    this.data = this.load();
+    this.data = this.empty();
+    try {
+      this.reload(this.statStamp());
+    } catch {
+      // Reported (and retried) by the first operation; http-logout can still reset the file.
+    }
   }
 
   private empty(): StoreData {
-    return { version: 1, clients: {}, access: {}, refresh: {}, rotated: {}, tokenIssued: {} };
+    return { version: 1, clients: {}, access: {}, refresh: {}, rotated: {}, tokenIssued: {}, lastActive: {} };
   }
 
   private statStamp(): string {
@@ -96,27 +145,40 @@ export class AuthStore {
     }
   }
 
-  private load(): StoreData {
-    const stamp = this.statStamp();
+  private reload(stamp: string): void {
     if (stamp === "missing") {
+      this.data = this.empty();
       this.stamp = stamp;
-      return this.empty();
+      this.unreadable = undefined;
+      return;
     }
-    const d = this.secrets.read<Partial<StoreData>>(this.file);
-    this.stamp = stamp;
-    return { ...this.empty(), ...d, version: 1 };
+    try {
+      const d = this.secrets.read<Partial<StoreData>>(this.file);
+      if (!d || typeof d !== "object" || Array.isArray(d)) throw new Error("unexpected content.");
+      this.data = { ...this.empty(), ...d, version: 1 };
+      this.stamp = stamp;
+      if (this.unreadable) console.error(`[gmail-mcp-multi] ${this.file} can be read again.`);
+      this.unreadable = undefined;
+    } catch (err) {
+      const why = (err as Error).message.replace(/\.$/, "");
+      if (this.unreadable !== why) console.error(`[gmail-mcp-multi] could not read ${this.file}: ${why}. Refusing to use or overwrite it until it can be read.`);
+      this.unreadable = why;
+      throw new AuthStoreError(
+        `The hosted-mode sign-in file ${this.file} could not be read (${why}). Nothing was changed. ` +
+          'Restore the file or the encryption key, or run "gmail-mcp-multi http-logout" to reset it (everyone must sign in again).'
+      );
+    }
   }
 
-  /** Re-read the file if another process changed it since we last saw it. */
+  /**
+   * Re-read the file if another process changed it since we last saw it. Throws
+   * AuthStoreError while the file can't be read, so no operation is answered from
+   * (or saved over the file from) an out-of-date copy.
+   */
   sync(): void {
-    if (this.statStamp() === this.stamp) return;
-    try {
-      this.data = this.load();
-    } catch (err) {
-      // A half-written file (Windows in-place write) or a key problem: keep the
-      // current state and retry on the next call rather than crash the server.
-      console.error("[gmail-mcp-multi] could not re-read http-auth.json:", (err as Error).message);
-    }
+    const stamp = this.statStamp();
+    if (stamp === this.stamp && !this.unreadable) return;
+    this.reload(stamp);
   }
 
   private prune(): void {
@@ -125,14 +187,42 @@ export class AuthStore {
       for (const [k, v] of Object.entries(map)) if (v.expiresAt <= now) delete map[k];
     }
     for (const [k, v] of Object.entries(this.data.rotated)) if (now - v.at > 60 * 24 * 3600_000) delete this.data.rotated[k];
-    for (const id of Object.keys(this.data.tokenIssued)) if (!this.data.clients[id]) delete this.data.tokenIssued[id];
+    for (const m of [this.data.tokenIssued, this.data.lastActive]) for (const id of Object.keys(m)) if (!this.data.clients[id]) delete m[id];
   }
 
   /** Persist. Callers must have called sync() before mutating (all public methods do). */
   private save(): void {
-    this.prune();
-    this.secrets.write(this.file, this.data);
-    this.stamp = this.statStamp();
+    try {
+      if (this.unreadable) throw new AuthStoreError(`${this.file} could not be read; not overwriting it.`);
+      if (this.statStamp() !== this.stamp) {
+        // Another process wrote the file after we read it: don't replace its changes with ours.
+        throw new AuthStoreError(`${this.file} was changed by another process during this request; nothing was saved. Try again.`);
+      }
+      this.prune();
+      this.writeAtomic();
+    } finally {
+      // Re-read on the next access: picks up our own write, or discards an unsaved change.
+      this.stamp = "";
+    }
+  }
+
+  private writeAtomic(): void {
+    ensureSecureDir(path.dirname(this.file));
+    const body = JSON.stringify(this.secrets.encrypt(this.data), null, 2) + "\n";
+    const tmp = `${this.file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+    try {
+      const fd = fs.openSync(tmp, "wx", 0o600);
+      try {
+        fs.writeFileSync(fd, body);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      renameWithRetry(tmp, this.file);
+    } catch (err) {
+      fs.rmSync(tmp, { force: true });
+      throw new AuthStoreError(`Could not save ${this.file}: ${(err as Error).message}`);
+    }
   }
 
   // ---- password fingerprint ----
@@ -186,20 +276,37 @@ export class AuthStore {
   }
 
   /**
-   * Make room for new registrations: drop up to `count` of the oldest clients
-   * that never obtained a token and were registered at least `minAgeMs` ago.
+   * Make room for new registrations: drop up to `count` clients, in this order:
+   *   1. clients that never obtained a token (oldest registration first), once
+   *      they are older than `unusedGraceMs`;
+   *   2. clients without any live token whose last token was issued more than
+   *      `inactiveMs` ago (longest inactive first).
+   * A client holding a live (unexpired) access or refresh token is never dropped.
    */
-  evictUnusedClients(count: number, minAgeMs: number): number {
+  evictClients(count: number, o: EvictOptions): number {
     this.sync();
     if (count <= 0) return 0;
-    const cutoff = Date.now() - minAgeMs;
-    const candidates = Object.values(this.data.clients)
-      .filter((c) => !this.data.tokenIssued[c.client_id] && (c.client_id_issued_at ?? 0) * 1000 <= cutoff)
-      .sort((a, b) => (a.client_id_issued_at ?? 0) - (b.client_id_issued_at ?? 0))
-      .slice(0, count);
-    for (const c of candidates) delete this.data.clients[c.client_id];
-    if (candidates.length) this.save();
-    return candidates.length;
+    const now = Date.now();
+    const live = new Set<string>();
+    for (const map of [this.data.access, this.data.refresh]) for (const t of Object.values(map)) if (t.expiresAt > now) live.add(t.clientId);
+    const keep = (id: string) => live.has(id) || Boolean(o.keep?.has(id));
+    const registered = (c: OAuthClientInformationFull) => (c.client_id_issued_at ?? 0) * 1000;
+    const active = (id: string) => this.data.lastActive[id] ?? this.data.tokenIssued[id] ?? 0;
+    const all = Object.values(this.data.clients);
+    const unused = all
+      .filter((c) => !this.data.tokenIssued[c.client_id] && !keep(c.client_id) && registered(c) <= now - o.unusedGraceMs)
+      .sort((a, b) => registered(a) - registered(b));
+    const inactive = all
+      .filter((c) => this.data.tokenIssued[c.client_id] && !keep(c.client_id) && active(c.client_id) <= now - o.inactiveMs)
+      .sort((a, b) => active(a.client_id) - active(b.client_id));
+    const victims = [...unused, ...inactive].slice(0, count);
+    for (const c of victims) {
+      delete this.data.clients[c.client_id];
+      delete this.data.tokenIssued[c.client_id];
+      delete this.data.lastActive[c.client_id];
+    }
+    if (victims.length) this.save();
+    return victims.length;
   }
 
   // ---- tokens ----
@@ -212,6 +319,7 @@ export class AuthStore {
     this.data.access[hashToken(access)] = { clientId: rec.clientId, scopes: rec.scopes, resource: rec.resource, family, expiresAt: now + ttl.accessMs };
     this.data.refresh[hashToken(refresh)] = { clientId: rec.clientId, scopes: rec.scopes, resource: rec.resource, family, expiresAt: now + ttl.refreshMs };
     this.data.tokenIssued[rec.clientId] ??= now;
+    this.data.lastActive[rec.clientId] = now;
     this.save();
     return { access, refresh, family, expiresInSec: Math.floor(ttl.accessMs / 1000) };
   }
@@ -279,9 +387,23 @@ export class AuthStore {
     return true;
   }
 
-  /** Sign everything out: drop all tokens, and optionally all registered clients. */
-  revokeAll(alsoClients: boolean): { tokens: number; clients: number } {
-    this.sync();
+  /**
+   * Sign everything out: drop all tokens, and optionally all registered clients.
+   * An unreadable file is replaced by an empty one (that signs everything out too),
+   * so this always works as the way out of a damaged file.
+   */
+  revokeAll(alsoClients: boolean): { tokens: number; clients: number; replacedUnreadable?: boolean } {
+    try {
+      this.sync();
+    } catch (err) {
+      if (!(err instanceof AuthStoreError)) throw err;
+      console.error(`[gmail-mcp-multi] replacing the unreadable ${this.file} with an empty one; every app must connect again.`);
+      this.data = this.empty();
+      this.unreadable = undefined;
+      this.stamp = this.statStamp();
+      this.save();
+      return { tokens: 0, clients: 0, replacedUnreadable: true };
+    }
     const tokens = Object.keys(this.data.access).length + Object.keys(this.data.refresh).length;
     const clients = alsoClients ? Object.keys(this.data.clients).length : 0;
     this.data.access = {};
@@ -290,6 +412,7 @@ export class AuthStore {
     if (alsoClients) {
       this.data.clients = {};
       this.data.tokenIssued = {};
+      this.data.lastActive = {};
     }
     this.save();
     return { tokens, clients };

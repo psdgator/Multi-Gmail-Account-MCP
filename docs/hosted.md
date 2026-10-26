@@ -84,8 +84,8 @@ Claude's OAuth callback is `https://claude.ai/api/mcp/auth_callback` (and, in fu
 | `GET /.well-known/oauth-protected-resource/mcp` (also without `/mcp`) | none | RFC 9728 resource metadata |
 | `GET /.well-known/oauth-authorization-server` | none | RFC 8414 server metadata |
 | `POST /register` | none (rate-limited, redirect allow-list) | Dynamic client registration |
-| `GET /authorize` | none | Shows the password page |
-| `POST /oauth/approve` | CSRF + password | Issues a one-time code |
+| `GET /authorize` | none (30 per 15 min per IP / IPv6 /64) | Shows the password page |
+| `POST /oauth/approve` | CSRF + password (20 per 15 min per IP / IPv6 /64) | Issues a one-time code |
 | `POST /token`, `POST /revoke` | client credentials | Tokens, refresh, revocation |
 | `POST/GET/DELETE /mcp` | **Bearer token** | MCP (Streamable HTTP, sessions) |
 
@@ -94,10 +94,11 @@ Claude's OAuth callback is `https://claude.ai/api/mcp/auth_callback` (and, in fu
 - **Nothing is reachable without the password.** Anyone can register an OAuth client, but only someone who knows `GMAIL_MCP_HTTP_PASSWORD` can approve it. The server refuses to start if the password is missing or shorter than 12 characters.
 - **Brute force:**
   - The password is compared in constant time.
-  - 5 wrong attempts from one IP (for IPv6: from one /64 network) lock that address. The first lock lasts 5 minutes, and each further lock doubles, up to 1 hour.
-  - There is no global lock. Many failures from different addresses only add a short delay (at most 2 seconds) to every attempt. Your correct password from your own address is never refused because of someone else's attempts.
-  - Each failure is answered slowly.
-  - The SDK also rate-limits the OAuth endpoints.
+  - **One guess per sign-in request.** A wrong password cancels the request; another try means starting the connection again from the app (a new `/authorize`).
+  - **Global speed limit.** Password checks run one at a time for the whole server, and each takes at least 0.4 seconds. That caps guessing at about 2.5 per second in total, however many addresses or connections an attacker uses. If more than 20 checks are waiting, the page answers `429` with `Retry-After` at once; nothing is checked, so you can press **Allow** again after the wait.
+  - **Lockouts.** 5 wrong attempts from one IP (for IPv6: from one /64 network) lock that address. 50 failures across the /64s of one IPv6 /48 lock the whole /48. The first lock lasts 5 minutes, and each further lock doubles, up to 1 hour. The lockout memory is bounded (10,000 networks; expired entries are dropped).
+  - There is no global lock. Your correct password from another network is never refused because of someone else's attempts; at most it waits its turn in the queue.
+  - **Rate limits per IP (IPv6: per /64):** `/authorize` 30 and `/oauth/approve` 20 requests per 15 minutes. The SDK also rate-limits the OAuth endpoints. At most 5,000 sign-in requests are open at a time (each expires after 10 minutes).
 - **OAuth 2.1:**
   - PKCE (S256) is mandatory.
   - Authorization codes are single-use and expire after 5 minutes. Replaying a code revokes the tokens it produced.
@@ -106,12 +107,18 @@ Claude's OAuth callback is `https://claude.ai/api/mcp/auth_callback` (and, in fu
   - Tokens are bound to this server's `/mcp` resource (RFC 8707), so tokens issued for any other resource are refused.
 - **Storage:**
   - Tokens are stored only as SHA-256 hashes. The token/client file (`/data/http-auth.json`) and all mail logins are encrypted with AES-256-GCM using `GMAIL_MCP_MASTER_KEY`.
+  - `http-auth.json` is written to a temporary file that is then renamed over the old one, so it is never seen half-written. Before every operation the server re-reads it if it changed (for example after `http-logout`).
+  - If the changed file can't be read (damaged, or a different key), the server answers `500` and changes nothing until it can be read again. It never answers from, or writes back, its older copy, so a sign-out from another process can't be undone. A save is also refused if the file changed while the request was handled. `http-logout` replaces an unreadable file with an empty one.
   - **Back up that key.** Without it the stored logins can't be decrypted. If it leaks, rotate it and sign in again.
 - **Redirects:** only Claude's callback URLs and loopback addresses (for local tools) may be registered.
   - Override with `GMAIL_MCP_HTTP_ALLOWED_REDIRECTS`: exact URIs, or prefixes ending in `*`.
   - A prefix only matches at a boundary (`/`, `?`, `#` or the end), so `https://app.example.com*` does not match `https://app.example.com.evil.net`.
   - Use `--no-loopback-redirects` to drop loopback.
-- **Client registrations:** at most 100 clients are kept. When the limit is reached, the oldest clients that registered but never completed a sign-in (and are older than 10 minutes) are dropped to make room. Clients that signed in are never dropped automatically.
+- **Client registrations:** at most 500 clients are kept. When the limit is reached, room is made by dropping, in this order:
+  - clients that registered but never completed a sign-in, oldest first, once they are 30 seconds old;
+  - clients that hold no valid token and haven't obtained one for 90 days.
+
+  A client that holds a valid token, or is between the password page and its token request, is never dropped. If nothing can be dropped, registration fails until `http-logout --clients` is run.
 - **Browser protections:**
   - The `Host` header must be your domain, which protects against DNS rebinding.
   - Browser `Origin`s other than your domain and claude.ai/claude.com are refused.
@@ -164,6 +171,9 @@ Note that TLS then ends at Cloudflare, which can see the traffic. A VPS with Cad
 | Claude says the connector failed to connect | `curl https://host/healthz` from outside; check DNS, ports 80/443, `docker compose logs` |
 | `redirect_uri not allowed` | Add Claude's callback to `GMAIL_MCP_HTTP_ALLOWED_REDIRECTS` if it changed |
 | `403 Invalid Host` | The request used a host name other than `GMAIL_MCP_PUBLIC_URL`; add it to `GMAIL_MCP_HTTP_ALLOWED_HOSTS` |
+| "Wrong password" | The sign-in request was cancelled. Click **Connect** in Claude again and enter the right password |
 | "Too many wrong passwords" | Wait the time shown (5 minutes for a first lock; it doubles for repeated locks from the same address), connect from another network, or restart the app |
+| "The server is busy with other sign-in attempts" / `429 Too many requests` | Someone is trying many passwords. Wait the time shown and try again; see the logs and consider changing the password |
+| `500` errors and `could not read …http-auth.json` in the logs | The token file is damaged or the encryption key changed. Restore the key (or file), or run `http-logout` to reset it; everyone then connects again |
 | Tools work, but an account fails | `docker compose run --rm app doctor`; re-run `auth … --manual` for that account |
 | Everything signed out after a restart | `GMAIL_MCP_MASTER_KEY` changed; restore the old key |

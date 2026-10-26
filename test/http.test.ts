@@ -6,14 +6,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { AccountManager } from "../src/accounts.js";
-import { AuthStore } from "../src/http/auth-store.js";
-import { ipKey, LoginLimiter, passwordMatches, redirectRuleMatches } from "../src/http/oauth-provider.js";
+import { AuthStore, AuthStoreError } from "../src/http/auth-store.js";
+import { AttemptQueue, ipKey, ipPrefix48, LoginLimiter, passwordMatches, redirectRuleMatches } from "../src/http/oauth-provider.js";
 import { buildHttpApp, HttpOptions, parsePublicUrl, RunningHttpServer, startHttpServer } from "../src/http/server.js";
 import { startFakeGmail } from "./fake-gmail.js";
 
 const PASSWORD = "correct horse battery staple";
+const DAY = 24 * 3600_000;
 const CLAUDE_CB = "https://claude.ai/api/mcp/auth_callback";
 
 let fake: Awaited<ReturnType<typeof startFakeGmail>>;
@@ -62,6 +63,7 @@ async function start(port?: number, extra: Partial<HttpOptions> = {}, homeDir = 
     password: PASSWORD,
     accounts: new AccountManager(homeDir),
     disableRateLimits: true,
+    attemptMinMs: 10,
     ...extra,
   });
 }
@@ -102,9 +104,9 @@ async function register(redirect = CLAUDE_CB, method = "client_secret_post") {
   return { status: r.status, body: (await r.json()) as { client_id: string; client_secret?: string; error?: string } };
 }
 
-async function openLogin(clientId: string, challenge: string, extra: Record<string, string> = {}) {
+async function openLogin(clientId: string, challenge: string, extra: Record<string, string> = {}, ip?: string) {
   const q = new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: CLAUDE_CB, code_challenge: challenge, code_challenge_method: "S256", state: "st-123", resource: mcpUrl, ...extra });
-  const r = await fetch(`${base}/authorize?${q}`, { redirect: "manual" });
+  const r = await fetch(`${base}/authorize?${q}`, { redirect: "manual", headers: ip ? { "x-forwarded-for": ip } : {} });
   const html = await r.text();
   const cookie = (r.headers.get("set-cookie") ?? "").split(";")[0];
   return {
@@ -112,6 +114,7 @@ async function openLogin(clientId: string, challenge: string, extra: Record<stri
     html,
     cookie,
     location: r.headers.get("location"),
+    retryAfter: r.headers.get("retry-after"),
     csp: r.headers.get("content-security-policy"),
     request: html.match(/name="request" value="([^"]+)"/)?.[1] ?? "",
     csrf: html.match(/name="csrf" value="([^"]+)"/)?.[1] ?? "",
@@ -125,7 +128,7 @@ async function approve(page: { request: string; csrf: string; cookie: string }, 
     headers: { "content-type": "application/x-www-form-urlencoded", cookie, ...(ip ? { "x-forwarded-for": ip } : {}) },
     body: new URLSearchParams({ request: page.request, csrf: page.csrf, password, action }).toString(),
   });
-  return { status: r.status, location: r.headers.get("location"), text: await r.text() };
+  return { status: r.status, location: r.headers.get("location"), retryAfter: r.headers.get("retry-after"), text: await r.text() };
 }
 
 async function token(params: Record<string, string>) {
@@ -263,8 +266,14 @@ describe("authorization + tokens", () => {
     expect(wrong.status).toBe(401);
     expect(wrong.location).toBeNull();
     expect(wrong.text).toContain("Wrong password");
+    expect(wrong.text).toContain("Start the connection again");
+    // A wrong password ends the request: the same form can't be used for another guess.
+    const reuse = await approve(page, PASSWORD);
+    expect(reuse.status).toBe(400);
+    expect(reuse.text).toContain("Request expired");
 
-    const ok = await approve(page, PASSWORD);
+    const page2 = await openLogin(client.client_id, challenge);
+    const ok = await approve(page2, PASSWORD);
     expect(ok.status).toBe(302);
     const loc = new URL(ok.location!);
     expect(`${loc.origin}${loc.pathname}`).toBe(CLAUDE_CB);
@@ -272,7 +281,7 @@ describe("authorization + tokens", () => {
     const code = loc.searchParams.get("code")!;
     expect(code.length).toBeGreaterThan(40);
 
-    expect((await approve(page, PASSWORD)).status).toBe(400); // pending request is single-use
+    expect((await approve(page2, PASSWORD)).status).toBe(400); // pending request is single-use
 
     const creds = { client_id: client.client_id, client_secret: client.client_secret! };
     const badPkce = await token({ grant_type: "authorization_code", code, code_verifier: pkce().verifier, redirect_uri: CLAUDE_CB, ...creds });
@@ -436,17 +445,61 @@ describe("store, limiter and redirect rules (units)", () => {
   });
 
   it("locks per IP / per /64 with backoff, never globally", () => {
-    const l = new LoginLimiter({ maxPerKey: 2, globalSoftThreshold: 4, globalMaxDelayMs: 500, baseLockMs: 1000 });
+    const l = new LoginLimiter({ maxPerKey: 2, baseLockMs: 1000 });
     for (let i = 0; i < 2; i++) l.fail("2001:db8:5:6::1");
     expect(l.lockedFor("2001:db8:5:6:ffff::9")).toBeGreaterThan(0); // same /64
     expect(l.lockedFor("2001:db8:5:7::1")).toBe(0);
-    for (let i = 0; i < 20; i++) l.fail(`198.51.100.${i}`);
+    for (let i = 0; i < 40; i++) l.fail(`198.51.100.${i}`);
     expect(l.lockedFor("192.0.2.200")).toBe(0); // the owner's fresh address is never refused
-    expect(l.globalDelayMs()).toBe(500); // only a bounded slowdown
     // Exponential backoff: the second lock of the same key lasts longer.
     const first = l.lockedFor("2001:db8:5:6::1");
     for (let i = 0; i < 2; i++) l.fail("2001:db8:5:6::1");
     expect(l.lockedFor("2001:db8:5:6::1")).toBeGreaterThan(first);
+  });
+
+  it("locks a whole IPv6 /48 after many failures across its /64s, but not other networks", () => {
+    expect(ipPrefix48("2001:db8:aa:4::1")).toBe(ipPrefix48("2001:0db8:00aa:ffff:1:2:3:4"));
+    expect(ipPrefix48("2001:db8:aa:4::1")).not.toBe(ipPrefix48("2001:db8:ab:4::1"));
+    expect(ipPrefix48("203.0.113.5")).toBeUndefined();
+    expect(ipPrefix48("::ffff:203.0.113.5")).toBeUndefined();
+    const l = new LoginLimiter({ maxPerKey: 5, maxPerPrefix: 12 });
+    for (const n of [1, 2]) for (let i = 0; i < 5; i++) l.fail(`2001:db8:aa:${n}::1`); // two /64s locked, 10 failures in the /48
+    expect(l.lockedFor("2001:db8:aa:1::9")).toBeGreaterThan(0);
+    expect(l.lockedFor("2001:db8:aa:3::1")).toBe(0); // the /48 is not locked yet
+    for (let i = 0; i < 2; i++) l.fail("2001:db8:aa:3::1"); // 12 failures in the /48
+    expect(l.lockedFor("2001:db8:aa:3::1")).toBeGreaterThan(0);
+    expect(l.lockedFor("2001:db8:aa:ffff::1")).toBeGreaterThan(0); // a fresh /64 of the same /48
+    expect(l.lockedFor("2001:db8:ab:1::1")).toBe(0); // the owner on another network is fine
+    expect(l.lockedFor("203.0.113.5")).toBe(0);
+  });
+
+  it("keeps the limiter's memory bounded: expired entries are dropped and the oldest go beyond the cap", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const l = new LoginLimiter({ maxPerKey: 1, baseLockMs: 60_000, maxEntries: 100 });
+      for (let i = 0; i < 1000; i++) l.fail(`10.0.${i >> 8}.${i & 255}`); // every one of them locked
+      expect(l.size).toBe(100);
+      expect(l.lockedFor("10.0.3.231")).toBeGreaterThan(0); // the most recent are kept
+      expect(l.lockedFor("10.0.0.0")).toBe(0); // the oldest were forgotten
+      vi.setSystemTime(Date.now() + 2 * DAY); // locks expired and a quiet day passed
+      l.fail("192.0.2.1");
+      expect(l.size).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("serializes password checks with a minimum time each and a bounded line", async () => {
+    const q = new AttemptQueue(50, 3);
+    const started = Date.now();
+    const runs = [q.run(() => 1), q.run(() => 2), q.run(() => 3)];
+    expect(q.run(() => 4)).toBeUndefined(); // line full: refused at once, nothing run
+    expect(q.length).toBe(3);
+    expect(q.retryAfterSec()).toBe(1);
+    expect(await Promise.all(runs)).toEqual([1, 2, 3]);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(140); // one at a time, >= 50 ms each
+    expect(q.length).toBe(0);
+    expect(await q.run(() => 5)).toBe(5);
   });
 
   it("matches redirect prefixes only at a path boundary", () => {
@@ -505,17 +558,75 @@ describe("store, limiter and redirect rules (units)", () => {
     expect(s.takeRefresh(t.refresh, 60_000)).toBe("reused"); // session dead: no grace any more
   });
 
-  it("evicts only old clients that never got a token", () => {
-    const s = storeFor(writeHome());
-    const now = Math.floor(Date.now() / 1000);
-    s.putClient({ client_id: "old-unused", client_id_issued_at: now - 3600, redirect_uris: [CLAUDE_CB] } as never);
-    s.putClient({ client_id: "old-used", client_id_issued_at: now - 7200, redirect_uris: [CLAUDE_CB] } as never);
-    s.putClient({ client_id: "new-unused", client_id_issued_at: now, redirect_uris: [CLAUDE_CB] } as never);
-    s.issue({ clientId: "old-used", scopes: [], resource: "https://x/mcp" }, { accessMs: 60_000, refreshMs: 60_000 });
-    expect(s.evictUnusedClients(5, 10 * 60_000)).toBe(1);
-    expect(s.getClient("old-unused")).toBeUndefined();
-    expect(s.getClient("old-used")).toBeTruthy();
-    expect(s.getClient("new-unused")).toBeTruthy();
+  it("evicts never-used clients after a short grace, then long-inactive ones, never one with live tokens", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const s = storeFor(writeHome());
+      const now = Date.now();
+      const put = (id: string, registeredAgoMs: number) =>
+        s.putClient({ client_id: id, client_id_issued_at: Math.floor((now - registeredAgoMs) / 1000), redirect_uris: [CLAUDE_CB] } as never);
+      put("unused-1h", 3600_000);
+      put("unused-40s", 40_000);
+      put("unused-5s", 5_000); // inside the grace period: a sign-in may be in progress
+      put("mid-sign-in", 60_000); // holds an authorization code (passed in `keep`)
+      for (const id of ["idle-100d", "idle-100d-live", "idle-10d"]) put(id, 200 * DAY);
+      const tok = (clientId: string, refreshMs: number) => s.issue({ clientId, scopes: [], resource: "https://x/mcp" }, { accessMs: 3600_000, refreshMs });
+      vi.setSystemTime(now - 100 * DAY);
+      tok("idle-100d", 30 * DAY); // all its tokens have expired since
+      tok("idle-100d-live", 200 * DAY); // still holds a live refresh token
+      vi.setSystemTime(now - 10 * DAY);
+      tok("idle-10d", 1000); // no live token, but active recently
+      vi.setSystemTime(now);
+      const o = { unusedGraceMs: 30_000, inactiveMs: 90 * DAY, keep: new Set(["mid-sign-in"]) };
+      expect(s.evictClients(1, o)).toBe(1);
+      expect(s.getClient("unused-1h")).toBeUndefined(); // the oldest never-used client goes first
+      expect(s.evictClients(10, o)).toBe(2);
+      expect(s.getClient("unused-40s")).toBeUndefined(); // never used, regardless of age
+      expect(s.getClient("idle-100d")).toBeUndefined(); // inactive for 100 days, no live tokens
+      for (const id of ["unused-5s", "mid-sign-in", "idle-100d-live", "idle-10d"]) expect(s.getClient(id)).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refuses to use or overwrite a sign-in file it can't read, and recovers when it can", () => {
+    const dir = writeHome();
+    const file = path.join(dir, "http-auth.json");
+    const a = storeFor(dir);
+    a.putClient({ client_id: "c1", redirect_uris: [CLAUDE_CB] } as never);
+    const t = a.issue({ clientId: "c1", scopes: [], resource: "https://x/mcp" }, { accessMs: 60_000, refreshMs: 60_000 });
+    const good = fs.readFileSync(file);
+    const torn = good.subarray(0, 40); // e.g. another process's write cut short
+    fs.writeFileSync(file, torn);
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      expect(() => a.issue({ clientId: "c1", scopes: [], resource: "https://x/mcp" }, { accessMs: 60_000, refreshMs: 60_000 })).toThrow(AuthStoreError);
+      expect(() => a.getAccess(t.access)).toThrow(/could not be read/); // no answers from the stale copy either
+      expect(() => a.revoke("c1", t.access)).toThrow(AuthStoreError);
+      expect(fs.readFileSync(file).equals(torn)).toBe(true); // never overwritten with stale state
+      fs.writeFileSync(file, good); // the file becomes readable again
+      expect(a.getAccess(t.access)).toBeTruthy();
+      // http-logout is the way out of a damaged file: it replaces it instead of failing.
+      fs.writeFileSync(file, "garbage");
+      expect(storeFor(dir).revokeAll(false)).toMatchObject({ replacedUnreadable: true });
+      expect(a.getAccess(t.access)).toBeUndefined();
+      expect(a.stats().clients).toBe(0);
+    } finally {
+      quiet.mockRestore();
+    }
+  });
+
+  it("writes the sign-in file atomically (temp file + rename), owner-only", () => {
+    const dir = writeHome();
+    const file = path.join(dir, "http-auth.json");
+    const s = storeFor(dir);
+    s.putClient({ client_id: "c1", redirect_uris: [CLAUDE_CB] } as never);
+    const ino = fs.statSync(file).ino;
+    s.putClient({ client_id: "c2", redirect_uris: [CLAUDE_CB] } as never);
+    expect(fs.statSync(file).ino).not.toBe(ino); // replaced, not rewritten in place
+    expect(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+    if (process.platform !== "win32") expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    expect(storeFor(dir).clientCount()).toBe(2);
   });
 });
 
@@ -551,25 +662,136 @@ describe("sign-out and abuse resistance (HTTP)", () => {
   });
 
   it("locks the attacking IP or IPv6 /64 but never refuses the right password from elsewhere", async () => {
-    const limited = await start(undefined, { failureDelayMs: 0, limiter: new LoginLimiter({ globalSoftThreshold: 5, globalMaxDelayMs: 50 }) });
+    const limited = await start(undefined, { attemptMinMs: 0 });
     try {
       await withServer(limited, async () => {
         const { body: client } = await register();
-        const page = await openLogin(client.client_id, pkce().challenge);
-        const started = Date.now();
+        // Every guess needs a fresh sign-in request: a wrong password ends the old one.
+        const guess = async (password: string, ip: string) => {
+          const page = await openLogin(client.client_id, pkce().challenge);
+          return approve(page, password, "approve", page.cookie, ip);
+        };
         // 6 IPv4 attackers x 5 attempts = 30 failures (the old global lock was 25).
-        for (let a = 1; a <= 6; a++) for (let i = 0; i < 5; i++) expect((await approve(page, "wrong password!!", "approve", page.cookie, `203.0.113.${a}`)).status).toBe(401);
-        for (let i = 0; i < 5; i++) await approve(page, "wrong password!!", "approve", page.cookie, `2001:db8:1:2::${i + 1}`);
-        expect(Date.now() - started).toBeLessThan(10_000); // bounded slowdown, not a lock
-        expect((await approve(page, PASSWORD, "approve", page.cookie, "203.0.113.1")).status).toBe(429);
-        expect((await approve(page, PASSWORD, "approve", page.cookie, "2001:db8:1:2:dead:beef::1")).status).toBe(429); // same /64
-        const ok = await approve(page, PASSWORD, "approve", page.cookie, "198.51.100.7");
-        expect(ok.status).toBe(302);
-        const page2 = await openLogin(client.client_id, pkce().challenge);
-        expect((await approve(page2, PASSWORD, "approve", page2.cookie, "2001:db8:1:3::1")).status).toBe(302); // next /64 is fine
+        for (let a = 1; a <= 6; a++) for (let i = 0; i < 5; i++) expect((await guess("wrong password!!", `203.0.113.${a}`)).status).toBe(401);
+        for (let i = 0; i < 5; i++) expect((await guess("wrong password!!", `2001:db8:1:2::${i + 1}`)).status).toBe(401);
+        expect((await guess(PASSWORD, "203.0.113.1")).status).toBe(429);
+        const sameNet = await guess(PASSWORD, "2001:db8:1:2:dead:beef::1"); // same /64
+        expect(sameNet.status).toBe(429);
+        expect(Number(sameNet.retryAfter)).toBeGreaterThan(0);
+        expect((await guess(PASSWORD, "198.51.100.7")).status).toBe(302);
+        expect((await guess(PASSWORD, "2001:db8:1:3::1")).status).toBe(302); // next /64 is fine
       });
     } finally {
       await limited.close();
+    }
+  });
+
+  it("checks passwords one at a time server-wide, still accepting the owner's", async () => {
+    const s = await start(undefined, { attemptMinMs: 150, attemptQueueMax: 20 });
+    try {
+      await withServer(s, async () => {
+        const { body: client } = await register();
+        const pages = await Promise.all(Array.from({ length: 5 }, () => openLogin(client.client_id, pkce().challenge)));
+        const started = Date.now();
+        // Four guesses from different addresses and the owner's correct password, all at once.
+        const results = await Promise.all(pages.map((pg, i) => approve(pg, i === 4 ? PASSWORD : "wrong password!!", "approve", pg.cookie, `198.51.100.${i + 10}`)));
+        expect(Date.now() - started).toBeGreaterThanOrEqual(700); // 5 checks x >= 150 ms, never in parallel
+        expect(results.map((r) => r.status)).toEqual([401, 401, 401, 401, 302]);
+
+        // Parallel guesses from one address stop at its limit even though all were queued before the first failed.
+        const burst = await Promise.all(Array.from({ length: 8 }, () => openLogin(client.client_id, pkce().challenge)));
+        const burstResults = await Promise.all(burst.map((pg) => approve(pg, "wrong password!!", "approve", pg.cookie, "192.0.2.77")));
+        expect(burstResults.filter((r) => r.status === 401)).toHaveLength(5);
+        expect(burstResults.filter((r) => r.status === 429)).toHaveLength(3);
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("answers 429 at once when too many password checks are waiting, keeping the form valid", async () => {
+    const s = await start(undefined, { attemptMinMs: 300, attemptQueueMax: 2 });
+    try {
+      await withServer(s, async () => {
+        const { body: client } = await register();
+        const pages = await Promise.all(Array.from({ length: 5 }, () => openLogin(client.client_id, pkce().challenge)));
+        const results = await Promise.all(pages.map((pg, i) => approve(pg, "wrong password!!", "approve", pg.cookie, `198.51.100.${i + 30}`)));
+        const busy = results.map((r, i) => ({ r, page: pages[i] })).filter((x) => x.r.status === 429);
+        expect(busy.length).toBe(3);
+        expect(results.filter((r) => r.status === 401)).toHaveLength(2);
+        for (const { r } of busy) {
+          expect(Number(r.retryAfter)).toBeGreaterThan(0);
+          expect(r.text).toContain("busy");
+        }
+        // Nothing was checked for those, so the same form still works once the line has cleared.
+        const later = await approve(busy[0].page, PASSWORD, "approve", busy[0].page.cookie, "198.51.100.99");
+        expect(later.status).toBe(302);
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("rate-limits /authorize and /oauth/approve per IP (IPv6: per /64)", async () => {
+    const s = await start(undefined, { authorizeRateLimit: { windowMs: 60_000, max: 3 }, approveRateLimit: { windowMs: 60_000, max: 2 } });
+    try {
+      await withServer(s, async () => {
+        const { body: client } = await register();
+        const open = (ip: string) => openLogin(client.client_id, pkce().challenge, {}, ip);
+        for (let i = 0; i < 3; i++) expect((await open(`2001:db8:9:9::${i + 1}`)).status).toBe(200);
+        const limited = await open("2001:db8:9:9:ffff::2"); // same /64
+        expect(limited.status).toBe(429);
+        expect(Number(limited.retryAfter)).toBeGreaterThan(0);
+        expect((await open("2001:db8:9:a::1")).status).toBe(200); // the next /64 is separate
+
+        const pages = [await open("192.0.2.1"), await open("192.0.2.2"), await open("192.0.2.3"), await open("192.0.2.4")];
+        expect((await approve(pages[0], "wrong password!!", "approve", pages[0].cookie, "203.0.113.77")).status).toBe(401);
+        expect((await approve(pages[1], "wrong password!!", "approve", pages[1].cookie, "203.0.113.77")).status).toBe(401);
+        const third = await approve(pages[2], PASSWORD, "approve", pages[2].cookie, "203.0.113.77");
+        expect(third.status).toBe(429); // refused before the password is even looked at
+        expect(Number(third.retryAfter)).toBeGreaterThan(0);
+        expect((await approve(pages[3], PASSWORD, "approve", pages[3].cookie, "203.0.113.78")).status).toBe(302);
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("keeps a bounded number of open sign-in requests", async () => {
+    const s = await start(undefined, { maxPending: 2 });
+    try {
+      await withServer(s, async () => {
+        const { body: client } = await register();
+        const [p1, p2, p3] = [await openLogin(client.client_id, pkce().challenge), await openLogin(client.client_id, pkce().challenge), await openLogin(client.client_id, pkce().challenge)];
+        expect((await approve(p1, PASSWORD)).status).toBe(400); // the oldest was dropped
+        expect((await approve(p2, PASSWORD)).status).toBe(302);
+        expect((await approve(p3, PASSWORD)).status).toBe(302);
+      });
+    } finally {
+      await s.close();
+    }
+  });
+
+  it("answers 500 (not 401) while the sign-in file can't be read, and never overwrites it", async () => {
+    const dir = writeHome();
+    const s = await start(undefined, {}, dir);
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await withServer(s, async () => {
+        const { tokens } = await connect();
+        expect(await probe(tokens.access_token)).toBe(400);
+        const file = path.join(dir, "http-auth.json");
+        const good = fs.readFileSync(file);
+        fs.writeFileSync(file, '{"v":1,"alg":');
+        expect(await probe(tokens.access_token)).toBe(500); // fails closed, but is not a sign-out
+        expect((await register()).status).toBe(500);
+        expect(fs.readFileSync(file, "utf8")).toBe('{"v":1,"alg":');
+        fs.writeFileSync(file, good);
+        expect(await probe(tokens.access_token)).toBe(400);
+      });
+    } finally {
+      quiet.mockRestore();
+      await s.close();
     }
   });
 
