@@ -13,7 +13,7 @@ import { decodeId, encodeId, ensureHeaders, ImapProvider, stripBcc } from "../sr
 import { MailRegistry } from "../src/providers/registry.js";
 import { startFakeGmail } from "./fake-gmail.js";
 import { buildOutgoing } from "../src/tools/compose.js";
-import { FAKE_IMAP, FakeMailServers, minimalStorage, startFakeMailServers } from "./fake-imap.js";
+import { exactStorage, FAKE_IMAP, FakeMailServers, imapStorage, minimalStorage, startFakeMailServers } from "./fake-imap.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const tmp = (p = "gmm-imap-") => fs.mkdtempSync(path.join(os.tmpdir(), p));
@@ -44,7 +44,7 @@ describe("Gmail query -> IMAP search", () => {
     const q = parseGmailQuery("newer_than:2d invoice τιμολόγιο -from:x@y -from:z@w", now);
     expect(q.notBefore?.toISOString()).toBe("2026-10-24T12:00:00.000Z");
     expect(q.criteria).toEqual({
-      since: new Date(Date.UTC(2026, 9, 24)),
+      since: new Date(Date.UTC(2026, 9, 23)), // a day wider for server time zones, exact afterwards
       text: "invoice",
       not: { from: "x@y" },
       or: [{ text: "τιμολόγιο", not: { from: "z@w" } }],
@@ -100,7 +100,6 @@ describe("Gmail query -> IMAP search", () => {
     const loc = parseGmailQuery("(in:sent OR from:a)", now);
     expect(loc.ignored[0]).toMatch(/^in:sent \(inside a group/);
     expect(loc.roles).toEqual([]);
-    expect(parseGmailQuery("(newer_than:2d OR from:a)", now).ignored[0]).toMatch(/^newer_than:2d \(inside a group/);
     expect(parseGmailQuery("(has:attachment OR from:a)", now).ignored[0]).toMatch(/^has:attachment \(inside a group/);
 
     const open = parseGmailQuery("(from:a", now);
@@ -113,11 +112,92 @@ describe("Gmail query -> IMAP search", () => {
     const o = parseGmailQuery("older_than:30d", now);
     expect(o.ignored).toEqual([]);
     expect(o.notAfter?.toISOString()).toBe("2026-09-26T12:00:00.000Z");
-    expect(o.criteria).toEqual({ before: new Date(Date.UTC(2026, 8, 27)) }); // whole day on the server, exact afterwards
+    expect(o.criteria).toEqual({ before: new Date(Date.UTC(2026, 8, 28)) }); // whole days (+1 for time zones) on the server, exact afterwards
     expect(parseGmailQuery("-newer_than:2d", now).notAfter?.toISOString()).toBe("2026-10-24T12:00:00.000Z");
     expect(parseGmailQuery("-older_than:3h", now).notBefore?.toISOString()).toBe("2026-10-26T09:00:00.000Z");
-    // Inside a group older_than rounds to whole days, never broader than asked.
-    expect(parseGmailQuery("(older_than:1d OR from:a)", now).criteria).toEqual({ or: [{ before: new Date(Date.UTC(2026, 9, 25)) }, { from: "a" }] });
+    // "-(older_than:30d)" is "-older_than:30d": newer than 30 days, exact.
+    const neg = parseGmailQuery("-(older_than:30d)", now);
+    expect(neg.notBefore?.toISOString()).toBe("2026-09-26T12:00:00.000Z");
+    expect([neg.notAfter, neg.ignored, neg.exact]).toEqual([undefined, [], []]);
+    // Inside groups and under NOT they are exact checks for the provider, not day-rounded criteria.
+    for (const g of ["(older_than:1d OR from:a)", "(newer_than:2d OR from:a)", "-(older_than:30d from:a)", "{newer_than:1h is:starred}"]) {
+      const r = parseGmailQuery(g, now);
+      expect(r.ignored, g).toEqual([]);
+      expect(r.exact, g).toHaveLength(1);
+      expect(r.criteria, g).toEqual({ all: true });
+    }
+    expect(parseGmailQuery("(older_than:1d OR from:a)", now).exact[0]).toEqual({
+      t: "or",
+      items: [{ t: "exact", leaf: { kind: "time", since: false, at: new Date("2026-10-25T12:00:00Z") } }, { t: "crit", crit: ["from", "a"] }],
+    });
+    expect(parseGmailQuery("-(older_than:30d from:a)", now).exact[0]).toMatchObject({ t: "not", item: { t: "and" } });
+  });
+
+  it("matches full addresses exactly and partial ones as substrings", () => {
+    const q = parseGmailQuery("from:Bob@Client.Example -to:x@y.example cc:team@client.example", now);
+    expect(q.addrs).toEqual([
+      { field: "from", addr: "bob@client.example", neg: false },
+      { field: "to", addr: "x@y.example", neg: true },
+      { field: "cc", addr: "team@client.example", neg: false },
+    ]);
+    // Positive ones narrow the server search (substring, never narrower); a negated one is not sent,
+    // because NOT TO "x@y.example" would also drop mail to "max@y.example".
+    expect(q.criteria).toEqual({ from: "Bob@Client.Example", cc: "team@client.example" });
+    expect(q.ignored).toEqual([]);
+    for (const partial of ["from:bob", "from:@client.example", "from:bob@client", 'from:"Bob Smith"', "to:x@y"]) {
+      expect(parseGmailQuery(partial, now).addrs, partial).toEqual([]);
+    }
+    // Inside groups they become exact checks too.
+    const g = parseGmailQuery("(from:bob@client.example OR from:carol@x.example) is:unread", now);
+    expect(g.exact).toEqual([
+      {
+        t: "or",
+        items: [
+          { t: "exact", leaf: { kind: "addr", field: "from", addr: "bob@client.example" } },
+          { t: "exact", leaf: { kind: "addr", field: "from", addr: "carol@x.example" } },
+        ],
+      },
+    ]);
+    expect(g.criteria).toEqual({ seen: false });
+    expect(parseGmailQuery("-(from:a@b.example OR from:c)", now).exact[0]).toMatchObject({ t: "not", item: { t: "or" } });
+    expect(parseGmailQuery("-(from:a@b.example)", now).addrs).toEqual([{ field: "from", addr: "a@b.example", neg: true }]);
+  });
+
+  it("makes Unix-timestamp after:/before: exact, and keeps plain dates as whole days", () => {
+    const ts = Date.UTC(2026, 9, 25, 6, 30) / 1000;
+    const a = parseGmailQuery(`after:${ts}`, now);
+    expect(a.notBefore?.toISOString()).toBe("2026-10-25T06:30:00.000Z");
+    expect(a.criteria).toEqual({ since: new Date(Date.UTC(2026, 9, 24)) });
+    const b = parseGmailQuery(`before:${ts} from:a`, now);
+    expect(b.notAfter?.toISOString()).toBe("2026-10-25T06:30:00.000Z");
+    expect(b.criteria).toEqual({ before: new Date(Date.UTC(2026, 9, 27)), from: "a" });
+    expect(parseGmailQuery(`-after:${ts}`, now).notAfter?.toISOString()).toBe("2026-10-25T06:30:00.000Z");
+    expect(parseGmailQuery(`-before:${ts}`, now).notBefore?.toISOString()).toBe("2026-10-25T06:30:00.000Z");
+    const g = parseGmailQuery(`(after:${ts} OR from:a)`, now);
+    expect(g.ignored).toEqual([]);
+    expect(g.exact[0]).toMatchObject({ t: "or", items: [{ t: "exact", leaf: { kind: "time", since: true } }, { t: "crit" }] });
+    // Plain dates are the server's whole days, everywhere.
+    expect(parseGmailQuery("(after:2026/10/01 OR from:a)", now).criteria).toEqual({ or: [{ since: new Date(Date.UTC(2026, 9, 1)) }, { from: "a" }] });
+    expect(parseGmailQuery("after:2026/10/01", now).notBefore).toBeUndefined();
+  });
+
+  it("supports rfc822msgid: (operator names may contain digits)", () => {
+    expect(tokenize("rfc822msgid:<k1@acme.example>")).toEqual([{ neg: false, op: "rfc822msgid", value: "<k1@acme.example>" }]);
+    const q = parseGmailQuery("rfc822msgid:k1@acme.example", now);
+    expect(q.criteria).toEqual({ header: { "message-id": "<k1@acme.example>" } });
+    expect(q.ignored).toEqual([]);
+  });
+
+  it("reports queries without any usable term; only the empty query means all mail", () => {
+    for (const bad of ["OR", "-", '""', "   ", "AND", "OR OR", "()", "-()", "( OR )", '-""']) {
+      const r = parseGmailQuery(bad, now);
+      expect(r.ignored, JSON.stringify(bad)).toEqual(["no usable search terms"]);
+      expect(r.criteria).toEqual({ all: true });
+    }
+    expect(parseGmailQuery("", now).ignored).toEqual([]);
+    for (const ok of ["in:inbox", "in:anywhere", "has:attachment", "-from:a@b.example", "newer_than:1d", "x OR"]) {
+      expect(parseGmailQuery(ok, now).ignored, ok).toEqual([]);
+    }
   });
 
   it("encodes ids and headers", () => {
@@ -347,6 +427,50 @@ describe("ImapProvider against a real IMAP + SMTP server", () => {
     p.deleteDraft = orig;
     expect(servers.sent).toHaveLength(1);
     expect(r.warning).toMatch(/WAS sent.*server hiccup.*do not send it again/);
+    // The draft is still there, but this server won't send it a second time.
+    await expect(p.sendDraft(d.draftId)).rejects.toThrow(/was already sent; not sending it again/);
+    expect(servers.sent).toHaveLength(1);
+  });
+
+  it("sends a draft only once when send_draft is called twice at the same time", async () => {
+    const d = await p.saveDraft(buildMime({ from: "antony@psdgator.com", to: ["carol@x.example"], subject: "twice?", text: "x" }));
+    const [a, b] = await Promise.allSettled([p.sendDraft(d.draftId), p.sendDraft(d.draftId)]);
+    expect(a.status).toBe("fulfilled");
+    expect(b.status).toBe("rejected");
+    expect((b as PromiseRejectedResult).reason.message).toMatch(/already being sent/);
+    expect(servers.sent).toHaveLength(1);
+    expect(await p.listDrafts(5)).toEqual([]);
+    await expect(p.sendDraft(d.draftId)).rejects.toThrow(/already sent/);
+    expect(servers.sent).toHaveLength(1);
+  });
+
+  it("deletes a draft with UID EXPUNGE, leaving other messages marked deleted alone", async () => {
+    // @ts-expect-error private: another mail app marked a message deleted but has not expunged it
+    const c = await p.conn();
+    const other = await c.append("Drafts", "From: x@y\r\nSubject: pending deletion\r\nMessage-ID: <pd@x>\r\n\r\nx", ["\\Draft", "\\Deleted"]);
+    const d = await p.saveDraft(buildMime({ from: "antony@psdgator.com", to: ["bob@client.example"], subject: "mine", text: "x" }));
+    await p.deleteDraft(d.draftId);
+    expect((await p.listDrafts(5)).map((x) => x.subject)).toEqual(["pending deletion"]);
+    expect(other.uid).toBeGreaterThan(0);
+  });
+
+  it("refuses to archive or move drafts out of the Drafts folder", async () => {
+    const d = await p.saveDraft(buildMime({ from: "antony@psdgator.com", to: ["bob@client.example"], subject: "stay", text: "x" }));
+    await expect(p.modify([d.draftId], { archive: true })).rejects.toThrow(/Drafts folder.*not archived or moved/);
+    await expect(p.modify([d.draftId], { moveToInbox: true })).rejects.toThrow(/Drafts folder/);
+    // Mixed with inbox mail: nothing changes at all.
+    const inbox = (await p.search({ query: "from:maria", max: 1 })).messages[0];
+    await expect(p.modify([inbox.id, d.draftId], { archive: true })).rejects.toThrow(/Drafts folder/);
+    expect(subjects(await p.search({ query: "from:maria", max: 5 }))).toEqual(["Προσφορά βιτρίνας"]);
+    expect((await p.listDrafts(5)).map((x) => x.subject)).toEqual(["stay"]);
+    await p.modify([d.draftId], { star: true }); // flags are fine
+  });
+
+  it("finds by rfc822msgid: and reports a query with no usable terms", async () => {
+    expect(subjects(await p.search({ query: "rfc822msgid:k1@acme.example", max: 5 }))).toEqual(["Προσφορά βιτρίνας"]);
+    expect(subjects(await p.search({ query: "rfc822msgid:<b1@client.example>", max: 5 }))).toEqual(["Ερώτηση για τιμολόγιο"]);
+    for (const query of ["OR", "-", '""', "  "]) expect((await p.search({ query, max: 5 })).ignored, query).toEqual(["no usable search terms"]);
+    expect((await p.search({ query: "", max: 5 })).ignored).toBeUndefined();
   });
 
   it("refuses labels that would move mail into or out of Trash, Spam, Drafts or Sent", async () => {
@@ -407,6 +531,8 @@ describe("ImapProvider on a bare mailbox (no Drafts folder, group addresses)", (
     const m = (await p.search({ query: "", max: 1 })).messages[0];
     await expect(p.modify([m.id], { addLabels: ["Spam"] })).rejects.toThrow(/junk folder/);
     await expect(p.modify([m.id], { addLabels: ["Κάδος"] })).rejects.toThrow(/trash folder/);
+    for (const name of ["Papelera", "Корзина", "Çöp Kutusu", "ÇÖP KUTUSU"]) await expect(p.modify([m.id], { addLabels: [name] }), name).rejects.toThrow(/trash folder/);
+    for (const name of ["Correo no deseado", "Posta indesiderata", "Pourriel"]) await expect(p.modify([m.id], { addLabels: [name] }), name).rejects.toThrow(/junk folder/);
     const r = await p.modify([m.id], { addLabels: ["Clients"] });
     expect(r.added).toEqual(["Clients"]);
   });
@@ -425,6 +551,157 @@ describe("ImapProvider on a bare mailbox (no Drafts folder, group addresses)", (
     expect(out.raw).not.toContain("<>");
     const parsed = await simpleParser(out.raw);
     expect(parsed.subject).toBe("Re: Group mail");
+  });
+});
+
+describe("ImapProvider: exact addresses and times, All Mail", () => {
+  let servers: FakeMailServers;
+  let p: ImapProvider;
+
+  beforeEach(async () => {
+    servers = await startFakeMailServers({ storage: exactStorage() });
+    const accounts = new AccountManager(tmp());
+    const acc = accounts.addAccount("exact", "antony@psdgator.com", undefined, {
+      type: "imap",
+      imap: { host: "127.0.0.1", port: servers.imapPort, secure: false, user: FAKE_IMAP.user, allowInsecureTls: true },
+    });
+    accounts.saveCredentials("exact", { password: FAKE_IMAP.pass });
+    p = new MailRegistry(accounts).get(acc) as ImapProvider;
+    return async () => {
+      await p.close();
+      await servers.close();
+    };
+  });
+
+  const subjects = (r: { messages: { subject: string }[]; ignored?: string[] }) => {
+    expect(r.ignored).toBeUndefined();
+    return r.messages.map((m) => m.subject);
+  };
+  const find = async (query: string, extra: { idsOnly?: boolean } = {}) => subjects(await p.search({ query, max: 20, ...extra }));
+
+  it("matches a full address exactly, not as a substring", async () => {
+    expect(await find("from:bob@client.example")).toEqual(["Real Bob"]);
+    expect(await find("from:BOB@Client.Example")).toEqual(["Real Bob"]);
+    expect(await find('from:"bob@client.example" in:inbox', { idsOnly: true })).toEqual(["Real Bob"]); // what unsubscribe's archive uses
+    expect(await find("to:bob@client.example")).toEqual(["To Bob"]);
+    expect(await find("cc:bob@client.example")).toEqual([]);
+    expect(await find("cc:notbob@client.example")).toEqual(["Cc lookalike"]);
+    // Partial values stay substrings.
+    expect(await find("from:bob")).toEqual(["Real Bob", "Lookalike prefix", "Lookalike suffix"]);
+    expect(await find("from:client.example")).toEqual(["Real Bob", "Lookalike prefix", "Lookalike suffix"]);
+    // Negated: only the exact address is excluded.
+    expect(await find("-from:bob@client.example")).toEqual(["Cc lookalike", "Lookalike prefix", "Lookalike suffix", "To Bob"]);
+  });
+
+  it("matches full addresses exactly inside OR / NOT groups", async () => {
+    expect(await find("(from:bob@client.example OR cc:bob@client.example)")).toEqual(["Real Bob"]);
+    expect(await find("{from:bob@client.example from:notbob@client.example}")).toEqual(["Real Bob", "Lookalike prefix"]);
+    expect(await find("-(from:bob@client.example OR to:bob@client.example)")).toEqual(["Cc lookalike", "Lookalike prefix", "Lookalike suffix"]);
+    expect(await find("(from:bob@client.example OR subject:suffix)", { idsOnly: true })).toEqual(["Real Bob", "Lookalike suffix"]);
+  });
+
+  it("applies timestamps, newer_than and older_than to the second, also in groups and under NOT", async () => {
+    // Real Bob 3h, Cc 1h, prefix 30h, suffix 50h, To Bob 10 days old.
+    const ts = Math.floor((Date.now() - 40 * 3_600_000) / 1000);
+    expect(await find(`after:${ts}`)).toEqual(["Cc lookalike", "Real Bob", "Lookalike prefix"]);
+    expect(await find(`before:${ts}`)).toEqual(["Lookalike suffix", "To Bob"]);
+    expect(await find(`-after:${ts}`)).toEqual(["Lookalike suffix", "To Bob"]);
+    expect(await find(`(after:${ts} OR from:carol@x.example)`)).toEqual(["Cc lookalike", "Real Bob", "Lookalike prefix", "To Bob"]);
+    expect(await find(`-(before:${ts} OR from:dan@x.example)`)).toEqual(["Real Bob", "Lookalike prefix"]);
+    expect(await find("-(older_than:2d)")).toEqual(["Cc lookalike", "Real Bob", "Lookalike prefix"]);
+    expect(await find("-(older_than:2d from:bob)")).toEqual(["Cc lookalike", "Real Bob", "Lookalike prefix", "To Bob"]);
+    expect(await find("(newer_than:2d OR from:carol@x.example)")).toEqual(["Cc lookalike", "Real Bob", "Lookalike prefix", "To Bob"]);
+    expect(await find("(older_than:29h OR subject:Real)")).toEqual(["Real Bob", "Lookalike prefix", "Lookalike suffix", "To Bob"]);
+    expect(await find("(older_than:31h OR subject:Real)")).toEqual(["Real Bob", "Lookalike suffix", "To Bob"]);
+  });
+
+  it("refuses to archive or move mail out of All Mail (that would delete it)", async () => {
+    const m = (await p.search({ query: 'label:"All Mail"', max: 5 })).messages[0];
+    expect(m.subject).toBe("In All Mail");
+    await expect(p.modify([m.id], { archive: true })).rejects.toThrow(/All Mail folder.*would delete it/);
+    await expect(p.modify([m.id], { moveToInbox: true })).rejects.toThrow(/All Mail folder/);
+    await p.modify([m.id], { markRead: true }); // flags are fine
+    expect(subjects(await p.search({ query: 'label:"All Mail"', max: 5 }))).toEqual(["In All Mail"]);
+  });
+});
+
+describe("ImapProvider on a server without UIDPLUS (and MOVE)", () => {
+  let servers: FakeMailServers | undefined;
+  let p: ImapProvider | undefined;
+  const subjects = (r: { messages: { subject: string }[] }) => r.messages.map((m) => m.subject);
+
+  async function start(without: string[]) {
+    servers = await startFakeMailServers({ storage: imapStorage(), without });
+    const accounts = new AccountManager(tmp());
+    const acc = accounts.addAccount("old", "antony@psdgator.com", undefined, {
+      type: "imap",
+      imap: { host: "127.0.0.1", port: servers.imapPort, secure: false, user: FAKE_IMAP.user, allowInsecureTls: true },
+    });
+    accounts.saveCredentials("old", { password: FAKE_IMAP.pass });
+    p = new MailRegistry(accounts).get(acc) as ImapProvider;
+    // @ts-expect-error private connection, to act like another mail app
+    const c = (await p.conn()) as import("imapflow").ImapFlow;
+    expect(c.capabilities.has("UIDPLUS")).toBe(false);
+    return { p, c };
+  }
+  beforeEach(() => async () => {
+    await p?.close();
+    await servers?.close();
+    p = servers = undefined;
+  });
+
+  it("does not expunge other messages marked deleted when deleting a draft", async () => {
+    const { p, c } = await start(["UIDPLUS"]);
+    const d = await p.saveDraft(buildMime({ from: "antony@psdgator.com", to: ["bob@client.example"], subject: "mine", text: "x" }));
+    const other = await c.append("Drafts", "From: x@y\r\nSubject: pending deletion\r\nMessage-ID: <pd@x>\r\n\r\nx", ["\\Draft", "\\Deleted"]);
+    await expect(p.deleteDraft(d.draftId)).rejects.toThrow(/no UIDPLUS.*1 other message/);
+    expect((await p.listDrafts(5)).map((x) => x.subject).sort()).toEqual(["mine", "pending deletion"]);
+    // Once nothing else is waiting to be expunged, deleting works.
+    const lock = await c.getMailboxLock("Drafts");
+    try {
+      await c.messageFlagsRemove(String(other.uid || (await c.search({ header: { "message-id": "<pd@x>" } }, { uid: true }))[0]), ["\\Deleted"], { uid: true });
+    } finally {
+      lock.release();
+    }
+    await p.deleteDraft(d.draftId);
+    expect((await p.listDrafts(5)).map((x) => x.subject)).toEqual(["pending deletion"]);
+  });
+
+  it("refuses moves that would expunge other deleted messages when there is no MOVE either", async () => {
+    const { p, c } = await start(["UIDPLUS", "MOVE"]);
+    const all = (await p.search({ query: "", max: 10 })).messages;
+    const news = all.find((m) => m.subject === "Weekly deals")!;
+    const old = all.find((m) => m.subject === "Old thing")!;
+    const lock = await c.getMailboxLock("INBOX");
+    try {
+      await c.messageFlagsAdd(news.id.split(":")[1], ["\\Deleted"], { uid: true });
+    } finally {
+      lock.release();
+    }
+    await expect(p.modify([old.id], { archive: true })).rejects.toThrow(/no UIDPLUS or MOVE.*1 other message/);
+    await expect(p.trash([old.id])).rejects.toThrow(/no UIDPLUS or MOVE/);
+    // Several folders: refused before the safe one (Sent, nothing marked deleted) is touched.
+    const sent = (await p.search({ query: "in:sent", max: 1 })).messages[0];
+    await expect(p.modify([sent.id, old.id], { archive: true, markRead: true })).rejects.toThrow(/Not changing "INBOX"/);
+    expect(subjects(await p.search({ query: "in:sent", max: 5 }))).toEqual(["Re: Ερώτηση για τιμολόγιο"]);
+    expect(subjects(await p.search({ query: "in:archive", max: 5 }))).toEqual([]);
+    expect(subjects(await p.search({ query: "", max: 10 }))).toEqual(["note to self", "Weekly deals", "Προσφορά βιτρίνας", "Ερώτηση για τιμολόγιο", "Old thing"]);
+  });
+
+  it("moves with MOVE (no expunge of other messages) even without UIDPLUS", async () => {
+    const { p, c } = await start(["UIDPLUS"]);
+    const all = (await p.search({ query: "", max: 10 })).messages;
+    const news = all.find((m) => m.subject === "Weekly deals")!;
+    const old = all.find((m) => m.subject === "Old thing")!;
+    const lock = await c.getMailboxLock("INBOX");
+    try {
+      await c.messageFlagsAdd(news.id.split(":")[1], ["\\Deleted"], { uid: true });
+    } finally {
+      lock.release();
+    }
+    await p.modify([old.id], { archive: true });
+    expect(subjects(await p.search({ query: "in:archive", max: 5 }))).toEqual(["Old thing"]);
+    expect(subjects(await p.search({ query: "", max: 10 }))).toContain("Weekly deals");
   });
 });
 

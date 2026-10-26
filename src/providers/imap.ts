@@ -1,11 +1,11 @@
 import * as crypto from "node:crypto";
-import { ImapFlow, type FetchMessageObject, type ListResponse, type MessageAddressObject, type MessageStructureObject, type SearchObject } from "imapflow";
+import { ImapFlow, type FetchMessageObject, type FetchQueryObject, type ListResponse, type MessageAddressObject, type MessageEnvelopeObject, type MessageStructureObject, type SearchObject } from "imapflow";
 import nodemailer from "nodemailer";
 import { simpleParser, type AddressObject, type ParsedMail } from "mailparser";
 import type { AccountConfig, AccountManager, ImapServerConfig } from "../accounts.js";
 import { htmlToText, type AttachmentInfo, type CleanMessage } from "../message.js";
 import { emailOf, hoursSince, mapLimit } from "../util.js";
-import { FolderRole, parseGmailQuery } from "./imap-query.js";
+import { compileNode, dayPlus, type AddrField, type ExactLeaf, type FolderRole, parseGmailQuery, type QNode } from "./imap-query.js";
 import { registerProviderFactory } from "./registry.js";
 import {
   AttachmentData,
@@ -111,6 +111,27 @@ function toDate(d: Date | string | undefined): Date {
   return Number.isNaN(x.getTime()) ? new Date(0) : x;
 }
 
+/** Does the envelope field hold exactly this (lower-case) address? Group markers have none. */
+function envelopeHas(env: MessageEnvelopeObject | undefined, field: AddrField, addr: string): boolean {
+  return (env?.[field] ?? []).some((a) => (a.address ?? "").trim().toLowerCase() === addr);
+}
+
+/** UIDs as a compact IMAP sequence set ("1:3,7"). */
+export function uidRanges(uids: number[]): string {
+  const sorted = [...new Set(uids)].sort((a, b) => a - b);
+  const parts: string[] = [];
+  for (let i = 0; i < sorted.length; ) {
+    let j = i;
+    while (j + 1 < sorted.length && sorted[j + 1] === sorted[j] + 1) j++;
+    parts.push(i === j ? String(sorted[i]) : `${sorted[i]}:${sorted[j]}`);
+    i = j + 1;
+  }
+  return parts.join(",");
+}
+
+const intersect = (a: Set<number>, b: Set<number>) => new Set([...a].filter((x) => b.has(x)));
+const minus = (a: Set<number>, b: Set<number>) => new Set([...a].filter((x) => !b.has(x)));
+
 /** Add Date and Message-ID if missing (Gmail adds these itself; IMAP servers don't). */
 export function ensureHeaders(raw: string, fromEmail: string): { raw: string; messageId: string } {
   const end = raw.indexOf("\r\n\r\n");
@@ -141,14 +162,21 @@ const ROLE_SPECIAL: Record<Exclude<FolderRole, "inbox">, string> = {
   all: "\\All",
 };
 
+/**
+ * Folder names by role, for servers without special-use flags: English, German, French,
+ * Spanish, Italian, Portuguese, Dutch, Polish, Russian, Turkish and Greek, as used by common
+ * webmail (Roundcube, Gmail, Outlook) translations. Names are compared NFC-normalized.
+ */
 const ROLE_NAMES: Record<Exclude<FolderRole, "inbox">, RegExp> = {
-  sent: /^(sent|sent items|sent mail|sent messages|gesendet|envoyés|απεσταλμένα|σταλμένα)$/i,
-  drafts: /^(drafts?|entwürfe|brouillons|πρόχειρα)$/i,
-  trash: /^(trash|deleted|deleted items|deleted messages|bin|papierkorb|corbeille|κάδος|διαγραμμένα)$/i,
-  junk: /^(junk|spam|junk e-?mail|ανεπιθύμητα)$/i,
-  archive: /^(archive|archives|archiv|αρχείο|αρχειοθέτηση)$/i,
-  all: /^(all mail|all)$/i,
+  sent: /^(sent|sent items|sent mail|sent messages|gesendet|gesendete elemente|envoyés|éléments envoyés|enviados|elementos enviados|posta inviata|itens enviados|verzonden|verzonden items|wysłane|elementy wysłane|отправленные|gönderilenler|απεσταλμένα|σταλμένα)$/iu,
+  drafts: /^(drafts?|entwürfe|brouillons|borradores|bozze|rascunhos|concepten|kopie robocze|черновики|taslaklar|πρόχειρα)$/iu,
+  trash: /^(trash|deleted|deleted items|deleted messages|bin|papierkorb|gelöschte elemente|corbeille|éléments supprimés|papelera|elementos eliminados|cestino|posta eliminata|lixeira|itens excluídos|prullenbak|verwijderde items|kosz|elementy usunięte|корзина|удаленные|удалённые|çöp kutusu|silinmiş öğeler|κάδος|διαγραμμένα)$/iu,
+  junk: /^(junk|spam|junk e-?mail|junk-e-mail|bulk mail|pourriel|courrier indésirable|correo no deseado|posta indesiderata|lixo eletrônico|ongewenste e-mail|wiadomości-śmieci|спам|нежелательная почта|gereksiz e-posta|ανεπιθύμητα)$/iu,
+  archive: /^(archive|archives|archiv|αρχείο|αρχειοθέτηση)$/iu,
+  all: /^(all mail|all|alle nachrichten|tous les messages|tutti i messaggi|вся почта|όλα τα μηνύματα)$/iu,
 };
+
+const namedAs = (role: Exclude<FolderRole, "inbox">, name: string) => ROLE_NAMES[role].test(name.normalize("NFC").trim());
 
 interface Folder {
   path: string;
@@ -165,6 +193,9 @@ export class ImapProvider implements MailProvider {
   private connecting?: Promise<ImapFlow>;
   private idleTimer?: NodeJS.Timeout;
   private folderCache?: { at: number; list: Folder[] };
+  /** Drafts being sent right now, and drafts already sent (by folder:uid): never send one twice. */
+  private sendingDrafts = new Set<string>();
+  private sentDrafts = new Set<string>();
 
   constructor(
     readonly account: AccountConfig,
@@ -278,7 +309,7 @@ export class ImapProvider implements MailProvider {
   async roleFolder(role: FolderRole, create = false): Promise<string | undefined> {
     if (role === "inbox") return "INBOX";
     const list = await this.folders();
-    const found = list.find((f) => f.specialUse === ROLE_SPECIAL[role]) ?? list.find((f) => f.selectable && ROLE_NAMES[role].test(f.name));
+    const found = list.find((f) => f.specialUse === ROLE_SPECIAL[role]) ?? list.find((f) => f.selectable && namedAs(role, f.name));
     if (found) return found.path;
     if (!create) return undefined;
     const name = role.charAt(0).toUpperCase() + role.slice(1);
@@ -295,7 +326,7 @@ export class ImapProvider implements MailProvider {
    */
   private protectedRole(f: Folder): "trash" | "junk" | "drafts" | "sent" | "all" | undefined {
     for (const role of ["trash", "junk", "drafts", "sent", "all"] as const) {
-      if (f.specialUse === ROLE_SPECIAL[role] || ROLE_NAMES[role].test(f.name) || ROLE_NAMES[role].test(f.path)) return role;
+      if (f.specialUse === ROLE_SPECIAL[role] || namedAs(role, f.name) || namedAs(role, f.path)) return role;
     }
     return undefined;
   }
@@ -311,6 +342,47 @@ export class ImapProvider implements MailProvider {
       all: "The All Mail folder can't be changed with labels.",
     }[role];
     throw new Error(`"${f.path}" is the ${role} folder of "${this.account.alias}"; it can't be ${verb === "add" ? "added as a label" : "removed as a label"}. ${why}`);
+  }
+
+  /**
+   * Moving mail OUT of All Mail removes it from every label (Gmail turns it into a deletion),
+   * and drafts are managed with the draft tools: refuse archive / moveToInbox from those.
+   */
+  private async refuseMoveFrom(path: string): Promise<void> {
+    const f = (await this.folders()).find((x) => x.path === path) ?? { path, name: path.split(/[/.]/).pop() ?? path, delimiter: "/", selectable: true };
+    const role = this.protectedRole(f);
+    if (role === "all") {
+      throw new Error(`"${path}" is the All Mail folder of "${this.account.alias}": moving mail out of it would delete it. Archive or move it from INBOX or its label folder instead.`);
+    }
+    if (role === "drafts") {
+      throw new Error(`"${path}" is the Drafts folder of "${this.account.alias}": drafts are not archived or moved. Use send_draft or delete_draft.`);
+    }
+  }
+
+  /**
+   * Removing messages ends in EXPUNGE. With UIDPLUS that is "UID EXPUNGE <these uids>". Without
+   * it, a plain EXPUNGE would also remove every other message flagged \Deleted in the folder
+   * (for example by another mail app that hides deletions until it compacts), so it is only
+   * allowed when no other message there carries \Deleted. A server with MOVE needs no
+   * EXPUNGE for moves.
+   */
+  private async refuseUnsafeExpunge(c: ImapFlow, path: string, uids: number[], forMove: boolean): Promise<void> {
+    if (c.capabilities.has("UIDPLUS") || (forMove && c.capabilities.has("MOVE"))) return;
+    const mine = new Set(uids);
+    const others = [...(await this.uidSearch(c, { deleted: true }))].filter((u) => !mine.has(u));
+    if (others.length) {
+      throw new Error(
+        `[${this.account.alias}] Not changing "${path}": this server has no UIDPLUS${forMove ? " or MOVE" : ""}, so removing a message would also erase ${others.length} other message(s) there that another mail app marked as deleted. ` +
+          "Empty or compact that folder in your mail app first."
+      );
+    }
+  }
+
+  /** Before moving out of several folders: refuse up front, so nothing is half done. */
+  private async precheckMoves(moves: [path: string, uids: number[]][]): Promise<void> {
+    const c = await this.conn();
+    if (c.capabilities.has("UIDPLUS") || c.capabilities.has("MOVE")) return;
+    for (const [path, uids] of moves) await this.withBox(path, (cl) => this.refuseUnsafeExpunge(cl, path, uids, true), true);
   }
 
   /** Resolve a user-given folder/label name (case-insensitive path or leaf name; "/" works as separator). */
@@ -510,7 +582,14 @@ export class ImapProvider implements MailProvider {
       this.withBox(
         path,
         async (c) => {
-          const uids = ((await c.search(q.criteria as SearchObject, { uid: true })) || []).sort((a, b) => b - a);
+          let uids = (await c.search(q.criteria as SearchObject, { uid: true })) || [];
+          // Groups with exact parts (addresses, time bounds under OR / NOT), as UID sets.
+          if (q.exact.length && uids.length) {
+            let set = new Set(uids);
+            for (const n of q.exact) set = await this.exactSet(c, n, set);
+            uids = [...set];
+          }
+          uids.sort((a, b) => b - a);
           estimate += uids.length;
           const found: CleanMessage[] = [];
           // Newest UIDs first, in batches, until enough pass the client-side filters.
@@ -524,6 +603,7 @@ export class ImapProvider implements MailProvider {
               if (q.hasAttachment !== undefined && hasAttachment(m.bodyStructure) !== q.hasAttachment) continue;
               if (q.notBefore && toDate(m.internalDate) < q.notBefore) continue;
               if (q.notAfter && toDate(m.internalDate) >= q.notAfter) continue;
+              if (!q.addrs.every((a) => envelopeHas(m.envelope, a.field, a.addr) !== a.neg)) continue;
               found.push(this.summary(path, m, extra));
             }
             found.sort((a, b) => (a.date < b.date ? 1 : -1));
@@ -543,6 +623,73 @@ export class ImapProvider implements MailProvider {
       estimate,
       ...(q.ignored.length ? { ignored: [...q.ignored] } : {}),
     };
+  }
+
+  /** UID search that fails loudly: a refused search must not turn into "no matches" (under NOT that would match everything). */
+  private async uidSearch(c: ImapFlow, crit: SearchObject): Promise<Set<number>> {
+    const r = await c.search(crit, { uid: true });
+    if (!Array.isArray(r)) throw new Error(`[${this.account.alias}] The mail server refused a search.`);
+    return new Set(r);
+  }
+
+  /** Fetch `query` for these UIDs (in chunks, so commands stay short). */
+  private async fetchEach(c: ImapFlow, uids: Iterable<number>, query: FetchQueryObject, fn: (m: FetchMessageObject) => void): Promise<void> {
+    const list = [...uids];
+    for (let i = 0; i < list.length; i += 500) {
+      for await (const m of c.fetch(uidRanges(list.slice(i, i + 500)), { uid: true, ...query }, { uid: true })) fn(m);
+    }
+  }
+
+  /** The UIDs in `within` that match `n` exactly (in the selected folder). */
+  private async exactSet(c: ImapFlow, n: QNode, within: Set<number>): Promise<Set<number>> {
+    if (!within.size) return within;
+    const server = compileNode(n);
+    if (server) return intersect(await this.uidSearch(c, server), within);
+    switch (n.t) {
+      case "exact":
+        return this.leafSet(c, n.leaf, within);
+      case "and": {
+        let r = within;
+        for (const x of n.items) r = await this.exactSet(c, x, r);
+        return r;
+      }
+      case "or": {
+        const r = new Set<number>();
+        let rest = within;
+        for (const x of n.items) {
+          const hit = await this.exactSet(c, x, rest);
+          for (const u of hit) r.add(u);
+          rest = minus(rest, hit);
+        }
+        return r;
+      }
+      case "not":
+        return minus(within, await this.exactSet(c, n.item, within));
+      default:
+        throw new Error("internal: unexpected query node");
+    }
+  }
+
+  private async leafSet(c: ImapFlow, leaf: ExactLeaf, within: Set<number>): Promise<Set<number>> {
+    const out = new Set<number>();
+    if (leaf.kind === "addr") {
+      // The server's substring match is a superset; keep those whose envelope has the exact address.
+      const cand = intersect(await this.uidSearch(c, { [leaf.field]: leaf.addr } as SearchObject), within);
+      await this.fetchEach(c, cand, { envelope: true }, (m) => {
+        if (envelopeHas(m.envelope, leaf.field, leaf.addr)) out.add(m.uid);
+      });
+      return out;
+    }
+    // Whole days on the server are certain more than a day away from the bound; only the
+    // three days around it need the internal date.
+    const sure = await this.uidSearch(c, leaf.since ? { since: dayPlus(leaf.at, 2) } : { before: dayPlus(leaf.at, -1) });
+    const cand = intersect(await this.uidSearch(c, leaf.since ? { since: dayPlus(leaf.at, -1) } : { before: dayPlus(leaf.at, 2) }), within);
+    const band = minus(cand, sure);
+    for (const u of cand) if (sure.has(u)) out.add(u);
+    await this.fetchEach(c, band, { internalDate: true }, (m) => {
+      if ((toDate(m.internalDate) >= leaf.at) === leaf.since) out.add(m.uid);
+    });
+    return out;
   }
 
   async inboxStatus(): Promise<InboxStatus> {
@@ -691,19 +838,28 @@ export class ImapProvider implements MailProvider {
     if (!(c.markRead || c.markUnread || c.star || c.unstar || c.archive || c.moveToInbox || addFolders.length || removeFolders.length)) {
       throw new Error("Nothing to change.");
     }
+    const groups = this.groupByBox(ids);
+    const moveTarget = (path: string): string | undefined => {
+      let target: string | undefined;
+      if (archive && path !== archive) target = archive;
+      if (c.moveToInbox && path !== "INBOX") target = "INBOX";
+      if (removeFolders.includes(path)) target = target ?? "INBOX";
+      return target;
+    };
+    // Checked for every folder BEFORE anything changes.
+    for (const path of groups.keys()) if (moveTarget(path)) await this.refuseMoveFrom(path);
+    await this.precheckMoves([...groups].filter(([path]) => moveTarget(path)));
 
-    for (const [path, uids] of this.groupByBox(ids)) {
+    for (const [path, uids] of groups) {
       await this.withBox(path, async (cl) => {
         const range = uids.join(",");
+        const target = moveTarget(path);
+        if (target) await this.refuseUnsafeExpunge(cl, path, uids, true);
         if (c.markRead) await cl.messageFlagsAdd(range, ["\\Seen"], { uid: true });
         if (c.markUnread) await cl.messageFlagsRemove(range, ["\\Seen"], { uid: true });
         if (c.star) await cl.messageFlagsAdd(range, ["\\Flagged"], { uid: true });
         if (c.unstar) await cl.messageFlagsRemove(range, ["\\Flagged"], { uid: true });
         for (const dest of addFolders) if (dest !== path) await cl.messageCopy(range, dest, { uid: true });
-        let target: string | undefined;
-        if (archive && path !== archive) target = archive;
-        if (c.moveToInbox && path !== "INBOX") target = "INBOX";
-        if (removeFolders.includes(path)) target = target ?? "INBOX";
         if (target) {
           const r = await cl.messageMove(range, target, { uid: true });
           for (const uid of uids) {
@@ -726,10 +882,13 @@ export class ImapProvider implements MailProvider {
 
   async trash(ids: string[]): Promise<number> {
     const trash = await this.roleFolder("trash", true);
+    const groups = this.groupByBox(ids);
+    await this.precheckMoves([...groups].filter(([path]) => path !== trash));
     let n = 0;
-    for (const [path, uids] of this.groupByBox(ids)) {
+    for (const [path, uids] of groups) {
       await this.withBox(path, async (c) => {
         if (path === trash) return;
+        await this.refuseUnsafeExpunge(c, path, uids, true);
         await c.messageMove(uids.join(","), trash!, { uid: true });
         n += uids.length;
       });
@@ -783,6 +942,9 @@ export class ImapProvider implements MailProvider {
   async deleteDraft(draftId: string): Promise<void> {
     const { path, uid } = await this.requireDraft(draftId);
     await this.withBox(path, async (c) => {
+      // UID EXPUNGE of this one draft when the server has UIDPLUS; otherwise only when no other
+      // message in Drafts is waiting to be expunged (see refuseUnsafeExpunge).
+      await this.refuseUnsafeExpunge(c, path, [uid], false);
       const ok = await c.messageDelete(String(uid), { uid: true });
       if (!ok) throw new Error(`Not found in "${this.account.alias}" (draft ${draftId}).`);
     });
@@ -830,19 +992,30 @@ export class ImapProvider implements MailProvider {
   }
 
   async sendDraft(draftId: string): Promise<{ messageId?: string; threadId?: string; warning?: string }> {
-    const { drafts } = await this.requireDraft(draftId); // checked BEFORE anything is sent
-    const m = await this.fetchSource(draftId);
-    const r = await this.send(m.source.toString("utf8"));
-    // Sent. From here on never throw: a retry would send the email twice.
+    const { path, uid } = this.parseIdOrThrow(draftId);
+    const key = encodeId(path, uid);
+    // Taken before the first await, so a second call for the same draft can't slip in.
+    if (this.sendingDrafts.has(key)) throw new Error(`Draft ${draftId} of "${this.account.alias}" is already being sent; not sending it twice.`);
+    if (this.sentDrafts.has(key)) throw new Error(`Draft ${draftId} of "${this.account.alias}" was already sent; not sending it again. Delete it by hand if it is still there.`);
+    this.sendingDrafts.add(key);
     try {
-      await this.deleteDraft(draftId);
-    } catch (err) {
-      return {
-        ...r,
-        warning: `The email WAS sent, but the draft could not be removed from ${drafts} (${(err as Error).message}). Delete it by hand; do not send it again.`,
-      };
+      const { drafts } = await this.requireDraft(draftId); // checked BEFORE anything is sent
+      const m = await this.fetchSource(draftId);
+      const r = await this.send(m.source.toString("utf8"));
+      this.sentDrafts.add(key);
+      // Sent. From here on never throw: a retry would send the email twice.
+      try {
+        await this.deleteDraft(draftId);
+      } catch (err) {
+        return {
+          ...r,
+          warning: `The email WAS sent, but the draft could not be removed from ${drafts} (${(err as Error).message}). Delete it by hand; do not send it again.`,
+        };
+      }
+      return r;
+    } finally {
+      this.sendingDrafts.delete(key);
     }
-    return r;
   }
 
   async needsReply(o: NeedsReplyOptions): Promise<NeedsReplyResult> {

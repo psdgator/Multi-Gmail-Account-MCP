@@ -184,7 +184,56 @@ export function minimalStorage(now = Date.now()) {
         { raw: bin(plain), flags: [], internaldate: d(2) },
       ],
     },
-    "": { separator: "/", folders: { Clients: {}, Spam: {}, [mutf7("Κάδος")]: {} } },
+    "": {
+      separator: "/",
+      folders: {
+        Clients: {},
+        Spam: {},
+        [mutf7("Κάδος")]: {},
+        // Localized Trash / Junk names without special-use flags.
+        Papelera: {},
+        [mutf7("Корзина")]: {},
+        [mutf7("Çöp Kutusu")]: {},
+        "Correo no deseado": {},
+        "Posta indesiderata": {},
+        Pourriel: {},
+      },
+    },
+  };
+}
+
+/**
+ * Look-alike addresses for exact matching (IMAP FROM/TO/CC are substring searches), spread
+ * over a few days for exact time bounds, plus an All Mail folder (special-use \All).
+ */
+export function exactStorage(now = Date.now()) {
+  const d = (hoursAgo: number) => new Date(now - hoursAgo * H);
+  const bin = (s: string) => Buffer.from(s, "utf8").toString("binary");
+  const mail = (id: string, hoursAgo: number, head: string[]) =>
+    ({
+      raw: bin([...head, `Message-ID: <${id}@x.example>`, `Date: ${d(hoursAgo).toUTCString()}`, "", "body"].join(CRLF)),
+      flags: [] as string[],
+      internaldate: d(hoursAgo),
+    });
+  return {
+    INBOX: {
+      messages: [
+        mail("to-bob", 240, ["From: Carol <carol@x.example>", "To: Bob <BOB@Client.Example>", "Subject: To Bob"]),
+        mail("suffix", 50, ["From: bob@client.example.evil.test", "To: antony@psdgator.com", "Subject: Lookalike suffix"]),
+        mail("prefix", 30, ["From: Not Bob <notbob@client.example>", "To: antony@psdgator.com", "Subject: Lookalike prefix"]),
+        mail("real", 3, ["From: Bob <bob@client.example>", "To: antony@psdgator.com", "Cc: team@client.example", "Subject: Real Bob"]),
+        mail("cc", 1, ["From: Dan <dan@x.example>", "To: antony@psdgator.com", "Cc: notbob@client.example", "Subject: Cc lookalike"]),
+      ],
+    },
+    "": {
+      separator: "/",
+      folders: {
+        "All Mail": { "special-use": "\\All", messages: [mail("all", 5, ["From: Eve <eve@x.example>", "To: antony@psdgator.com", "Subject: In All Mail"])] },
+        Drafts: { "special-use": "\\Drafts" },
+        Trash: { "special-use": "\\Trash" },
+        Archive: { "special-use": "\\Archive" },
+      },
+    },
   };
 }
 
@@ -195,9 +244,12 @@ export interface FakeMailServers {
   close(): Promise<void>;
 }
 
-export async function startFakeMailServers(opts: { storage?: Record<string, unknown> } = {}): Promise<FakeMailServers> {
+const PLUGINS = ["ID", "ENABLE", "IDLE", "SPECIAL-USE", "UIDPLUS", "MOVE", "UNSELECT", "LITERALPLUS", "ESEARCH", "NAMESPACE", "CREATE-SPECIAL-USE"];
+
+/** `without` drops server extensions, e.g. ["UIDPLUS", "MOVE"] for an old server. */
+export async function startFakeMailServers(opts: { storage?: Record<string, unknown>; without?: string[] } = {}): Promise<FakeMailServers> {
   const imap = hoodiecrow({
-    plugins: ["ID", "ENABLE", "IDLE", "SPECIAL-USE", "UIDPLUS", "MOVE", "UNSELECT", "LITERALPLUS", "ESEARCH", "NAMESPACE", "CREATE-SPECIAL-USE"],
+    plugins: PLUGINS.filter((x) => !(opts.without ?? []).includes(x)),
     storage: opts.storage ?? imapStorage(),
   });
   await new Promise<void>((r) => imap.listen(0, "127.0.0.1", r));
