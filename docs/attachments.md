@@ -27,10 +27,12 @@ These can't be read: legacy binary Office (`.doc`, `.xls`, `.ppt`, `.msg`), Post
 
 - **Output size:** text is capped at 30,000 characters by default (`maxChars`, up to 200,000), and a note says how to read more. Long PDFs stop at the cap, and you continue with `pages`.
 - **Images:** up to about 3.7 MB and 8000 px per side, which is Claude's own image limit. For anything bigger, use `save_attachment`.
-- **Sheets:** each sheet is capped at 1,000 rows, and repeated empty rows and columns are collapsed.
+- **Sheets:** each sheet is capped at 1,000 rows and 500 columns, and repeated empty rows and columns are collapsed. OpenDocument repeat attributes are capped too, so a tiny `.ods` can't expand into millions of cells.
 - **ZIP bombs:** archives are only opened while every file inside is under 25 MB and the total is under 50 MB, with at most 5,000 entries. Archives that lie about their sizes are truncated rather than expanded.
 - **Damaged files:** the tool never crashes. It returns `kind: "unsupported"` with a note.
-- **No stdout noise:** PDF parser warnings go to stderr, so the MCP connection is never corrupted.
+- **Isolated and time-limited:** each attachment is read in a separate worker thread with a **20-second limit** and a **512 MB memory cap**. If a file is too slow or too big to read, it's stopped and you get a note suggesting `save_attachment`. The server itself never freezes, which matters in hosted mode where many sessions share one process. Change the limits with `GMAIL_MCP_EXTRACT_TIMEOUT_MS` and `GMAIL_MCP_EXTRACT_MEMORY_MB`.
+- **Linear-time parsing:** the parsers are built so hostile files (thousands of unclosed tags, huge runs of spaces, crafted PDFs) take time proportional to their size and nothing more.
+- **No stdout noise:** parser output goes to stderr, never stdout, so the MCP connection can't be corrupted.
 - **Untrusted content:** attachments can contain text written to manipulate an AI ("ignore your instructions and forward…"). The tool description and the server instructions tell Claude never to follow instructions found inside files or emails.
 
 ## Examples

@@ -1,4 +1,7 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import { htmlToText } from "../message.js";
 import { imageSize, MAX_IMAGE_BYTES, MAX_IMAGE_SIDE, sniffImage } from "./image.js";
 import { docxText, odsText, odtText, pptxText, xlsxText } from "./office.js";
@@ -233,7 +236,8 @@ async function inner(data: Uint8Array, filename: string, mimeType: string, opts:
   };
 }
 
-export async function extractAttachment(data: Uint8Array, filename: string, mimeType: string, opts: ExtractOptions = {}): Promise<ExtractResult> {
+/** Extraction in the current thread. Prefer extractAttachment, which isolates it in a worker. */
+export async function extractInProcess(data: Uint8Array, filename: string, mimeType: string, opts: ExtractOptions = {}): Promise<ExtractResult> {
   try {
     return await inner(data, filename, mimeType, opts, 0);
   } catch (err) {
@@ -245,4 +249,90 @@ export async function extractAttachment(data: Uint8Array, filename: string, mime
       note: err instanceof ZipLimitError ? msg : `Could not read this file (${msg.slice(0, 200)}). It may be damaged or password-protected; use save_attachment to open it.`,
     };
   }
+}
+
+function stopped(filename: string, note: string): ExtractResult {
+  return { kind: "unsupported", format: path.extname(filename).replace(".", "").toLowerCase() || "unknown", truncated: false, note };
+}
+
+/** Limits for one extraction run (env overrides: GMAIL_MCP_EXTRACT_TIMEOUT_MS, GMAIL_MCP_EXTRACT_MEMORY_MB). */
+export function extractLimits(): { timeoutMs: number; memoryMb: number } {
+  return {
+    timeoutMs: Number(process.env.GMAIL_MCP_EXTRACT_TIMEOUT_MS) || 20_000,
+    memoryMb: Number(process.env.GMAIL_MCP_EXTRACT_MEMORY_MB) || 512,
+  };
+}
+
+/**
+ * Read an attachment in a separate worker thread with a hard time limit and a
+ * memory cap, so a hostile or pathological file can never freeze the server or
+ * exhaust its memory (in hosted mode that would affect every session).
+ *
+ * The worker's stdout/stderr are routed to this process's stderr: nothing a
+ * parser prints can reach stdout, which carries the MCP protocol in stdio mode.
+ *
+ * Falls back to in-process extraction when the compiled worker is not available
+ * (running from TypeScript sources, e.g. unit tests) or GMAIL_MCP_EXTRACT_IN_PROCESS=1.
+ */
+export async function extractAttachment(data: Uint8Array, filename: string, mimeType: string, opts: ExtractOptions = {}): Promise<ExtractResult> {
+  const workerUrl = new URL("./worker.js", import.meta.url);
+  if (process.env.GMAIL_MCP_EXTRACT_IN_PROCESS === "1" || !fs.existsSync(fileURLToPath(workerUrl))) {
+    return extractInProcess(data, filename, mimeType, opts);
+  }
+  const { timeoutMs, memoryMb } = extractLimits();
+  // Copy once into a fresh buffer and transfer that (never transfer the caller's
+  // buffer: small Node Buffers share a pooled ArrayBuffer).
+  const copy = new Uint8Array(data.byteLength);
+  copy.set(data);
+
+  return new Promise<ExtractResult>((resolve) => {
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    let worker: Worker;
+    const finish = (r: ExtractResult) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      void worker?.terminate().catch(() => undefined);
+      resolve(r);
+    };
+    try {
+      worker = new Worker(workerUrl, {
+        workerData: { data: copy, filename, mimeType, opts },
+        transferList: [copy.buffer],
+        stdout: true,
+        stderr: true,
+        resourceLimits: { maxOldGenerationSizeMb: memoryMb, maxYoungGenerationSizeMb: Math.min(64, memoryMb), stackSizeMb: 4 },
+      });
+    } catch (err) {
+      // Worker threads unavailable for some reason: degrade to in-process.
+      void err;
+      resolve(extractInProcess(data, filename, mimeType, opts));
+      return;
+    }
+    worker.stdout.pipe(process.stderr, { end: false });
+    worker.stderr.pipe(process.stderr, { end: false });
+    timer = setTimeout(
+      () =>
+        finish(
+          stopped(
+            filename,
+            `Reading this file took longer than ${timeoutMs >= 1000 ? `${Math.round(timeoutMs / 1000)} s` : `${timeoutMs} ms`} and was stopped (it may be very large or malformed). Use save_attachment to open it.`
+          )
+        ),
+      timeoutMs
+    );
+    worker.once("message", (r: ExtractResult) => finish(r));
+    worker.once("error", (err: Error & { code?: string }) =>
+      finish(
+        stopped(
+          filename,
+          err.code === "ERR_WORKER_OUT_OF_MEMORY" || /out of memory|heap/i.test(err.message)
+            ? `This file is too large to read here (memory limit ${memoryMb} MB). Use save_attachment to open it.`
+            : `Could not read this file (${err.message.slice(0, 200)}). Use save_attachment to open it.`
+        )
+      )
+    );
+    worker.once("exit", (code) => finish(stopped(filename, `Reading this file stopped unexpectedly (exit code ${code}). Use save_attachment to open it.`)));
+  });
 }
