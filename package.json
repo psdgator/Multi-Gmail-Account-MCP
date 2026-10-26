@@ -53,7 +53,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/psdgator/Multi-Gmail-Account-MCP.git"
+    "url": "git+https://github.com/psdgator/Multi-Gmail-Account-MCP.git"
   },
   "dependencies": {
     "@googleapis/calendar": "^20.1.0",
