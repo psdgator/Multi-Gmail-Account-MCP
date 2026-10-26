@@ -8,12 +8,14 @@ import { hostHeaderValidation } from "@modelcontextprotocol/sdk/server/middlewar
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { AccountManager } from "../accounts.js";
+import { AuditLog } from "../audit.js";
 import type { Mode } from "../config.js";
+import { MailRegistry } from "../providers/registry.js";
 import { createServer } from "../server.js";
 import type { ToolContext } from "../tools/common.js";
 import { VERSION } from "../version.js";
 import { AuthStore } from "./auth-store.js";
-import { CLAUDE_CALLBACKS, PasswordOAuthProvider } from "./oauth-provider.js";
+import { CLAUDE_CALLBACKS, LoginLimiter, PasswordOAuthProvider } from "./oauth-provider.js";
 
 /**
  * Hosted mode: the MCP server over Streamable HTTP, protected by the built-in
@@ -47,6 +49,11 @@ export interface HttpOptions {
   accounts?: AccountManager;
   accessTtlMs?: number;
   refreshTtlMs?: number;
+  refreshReuseGraceMs?: number;
+  maxClients?: number;
+  clientEvictMinAgeMs?: number;
+  failureDelayMs?: number;
+  limiter?: LoginLimiter;
   sessionIdleMs?: number;
   maxSessions?: number;
   /** Disable the SDK's rate limits (tests). */
@@ -93,6 +100,8 @@ export interface RunningHttpServer {
   store: AuthStore;
   provider: PasswordOAuthProvider;
   sessions: Map<string, Session>;
+  /** Provider registry shared by all sessions. */
+  mail: MailRegistry;
   close: () => Promise<void>;
 }
 
@@ -102,6 +111,12 @@ export function buildHttpApp(opts: HttpOptions) {
   const accounts = opts.accounts ?? new AccountManager();
   const mcpUrl = new URL("/mcp", publicUrl);
   const store = new AuthStore(accounts.root, accounts.secrets);
+  // Changing the access password signs every connected app out.
+  const pw = store.syncPassword(password);
+  if (pw.changed) console.error(`[gmail-mcp-multi] access password changed: revoked ${pw.revokedTokens} tokens; connected apps must sign in again.`);
+  // One registry for all sessions, so IMAP connections and caches are shared.
+  const mail = new MailRegistry(accounts);
+  const audit = new AuditLog(accounts.root);
   const provider = new PasswordOAuthProvider({
     password,
     resource: mcpUrl,
@@ -111,6 +126,11 @@ export function buildHttpApp(opts: HttpOptions) {
     secureCookies: publicUrl.protocol === "https:",
     accessTtlMs: opts.accessTtlMs,
     refreshTtlMs: opts.refreshTtlMs,
+    refreshReuseGraceMs: opts.refreshReuseGraceMs,
+    maxClients: opts.maxClients,
+    clientEvictMinAgeMs: opts.clientEvictMinAgeMs,
+    failureDelayMs: opts.failureDelayMs,
+    limiter: opts.limiter,
   });
 
   const app = express();
@@ -221,7 +241,7 @@ export function buildHttpApp(opts: HttpOptions) {
         const oldest = [...sessions.entries()].sort((a, b) => a[1].lastSeen - b[1].lastSeen)[0];
         if (oldest) await dropSession(oldest[0]);
       }
-      const { server, ctx } = createServer(opts.mode, { transport: "http", accounts });
+      const { server, ctx } = createServer(opts.mode, { transport: "http", accounts, mail, audit });
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => crypto.randomUUID(),
         onsessioninitialized: (id) => {
@@ -231,20 +251,16 @@ export function buildHttpApp(opts: HttpOptions) {
             clientId,
             lastSeen: Date.now(),
             close: async () => {
+              // The mail registry is shared by all sessions; it is closed with the server.
               await transport.close().catch(() => undefined);
               await server.close().catch(() => undefined);
-              await ctx.mail.closeAll().catch(() => undefined);
             },
           });
         },
       });
       transport.onclose = () => {
         const id = transport.sessionId;
-        if (id && sessions.has(id)) {
-          const s = sessions.get(id)!;
-          sessions.delete(id);
-          void s.ctx.mail.closeAll().catch(() => undefined);
-        }
+        if (id) sessions.delete(id);
       };
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
@@ -258,7 +274,7 @@ export function buildHttpApp(opts: HttpOptions) {
     res.status(404).json({ error: "not_found" });
   });
 
-  return { app, store, provider, sessions, mcpUrl, publicUrl, accounts };
+  return { app, store, provider, sessions, mcpUrl, publicUrl, accounts, mail };
 }
 
 export async function startHttpServer(opts: HttpOptions): Promise<RunningHttpServer> {
@@ -275,9 +291,11 @@ export async function startHttpServer(opts: HttpOptions): Promise<RunningHttpSer
     store: built.store,
     provider: built.provider,
     sessions: built.sessions,
+    mail: built.mail,
     close: async () => {
       await Promise.all([...built.sessions.values()].map((s) => s.close()));
       built.sessions.clear();
+      await built.mail.closeAll().catch(() => undefined);
       const closed = new Promise<void>((r) => server.close(() => r()));
       server.closeAllConnections?.();
       await closed;

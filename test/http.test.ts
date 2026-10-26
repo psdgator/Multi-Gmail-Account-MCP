@@ -8,8 +8,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AccountManager } from "../src/accounts.js";
-import { LoginLimiter, passwordMatches } from "../src/http/oauth-provider.js";
-import { buildHttpApp, parsePublicUrl, RunningHttpServer, startHttpServer } from "../src/http/server.js";
+import { AuthStore } from "../src/http/auth-store.js";
+import { ipKey, LoginLimiter, passwordMatches, redirectRuleMatches } from "../src/http/oauth-provider.js";
+import { buildHttpApp, HttpOptions, parsePublicUrl, RunningHttpServer, startHttpServer } from "../src/http/server.js";
 import { startFakeGmail } from "./fake-gmail.js";
 
 const PASSWORD = "correct horse battery staple";
@@ -51,7 +52,7 @@ function writeHome(): string {
   return dir;
 }
 
-async function start(port?: number): Promise<RunningHttpServer> {
+async function start(port?: number, extra: Partial<HttpOptions> = {}, homeDir = home): Promise<RunningHttpServer> {
   const p = port ?? (await freePort());
   return startHttpServer({
     mode: "drafts",
@@ -59,10 +60,32 @@ async function start(port?: number): Promise<RunningHttpServer> {
     port: p,
     host: "127.0.0.1",
     password: PASSWORD,
-    accounts: new AccountManager(home),
+    accounts: new AccountManager(homeDir),
     disableRateLimits: true,
+    ...extra,
   });
 }
+
+/** Point the request helpers at another running server for the duration of fn. */
+async function withServer<T>(s: RunningHttpServer, fn: () => Promise<T>): Promise<T> {
+  const [b, m] = [base, mcpUrl];
+  base = s.url;
+  mcpUrl = s.mcpUrl;
+  try {
+    return await fn();
+  } finally {
+    base = b;
+    mcpUrl = m;
+  }
+}
+
+/** 400 (= authenticated, but no session) vs 401 (= token refused). */
+async function probe(accessToken: string): Promise<number> {
+  const r = await fetch(mcpUrl, { method: "POST", headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" }, body: "{}" });
+  return r.status;
+}
+
+const storeFor = (dir = home) => new AuthStore(dir, new AccountManager(dir).secrets);
 
 const pkce = () => {
   const verifier = crypto.randomBytes(32).toString("base64url");
@@ -95,11 +118,11 @@ async function openLogin(clientId: string, challenge: string, extra: Record<stri
   };
 }
 
-async function approve(page: { request: string; csrf: string; cookie: string }, password: string, action = "approve", cookie = page.cookie) {
+async function approve(page: { request: string; csrf: string; cookie: string }, password: string, action = "approve", cookie = page.cookie, ip?: string) {
   const r = await fetch(`${base}/oauth/approve`, {
     method: "POST",
     redirect: "manual",
-    headers: { "content-type": "application/x-www-form-urlencoded", cookie },
+    headers: { "content-type": "application/x-www-form-urlencoded", cookie, ...(ip ? { "x-forwarded-for": ip } : {}) },
     body: new URLSearchParams({ request: page.request, csrf: page.csrf, password, action }).toString(),
   });
   return { status: r.status, location: r.headers.get("location"), text: await r.text() };
@@ -110,15 +133,20 @@ async function token(params: Record<string, string>) {
   return { status: r.status, body: (await r.json()) as Record<string, string> };
 }
 
-/** Full happy path: register -> password -> code -> tokens. */
-async function connect() {
-  const { body: client } = await register();
+/** password -> code -> tokens for an already registered client. */
+async function signIn(client: { client_id: string; client_secret?: string }, password = PASSWORD) {
   const { verifier, challenge } = pkce();
   const page = await openLogin(client.client_id, challenge);
-  const ok = await approve(page, PASSWORD);
+  const ok = await approve(page, password);
   const code = new URL(ok.location!).searchParams.get("code")!;
   const t = await token({ grant_type: "authorization_code", code, code_verifier: verifier, redirect_uri: CLAUDE_CB, client_id: client.client_id, client_secret: client.client_secret!, resource: mcpUrl });
-  return { client, tokens: t.body };
+  return t.body;
+}
+
+/** Full happy path: register -> password -> code -> tokens. */
+async function connect(password = PASSWORD) {
+  const { body: client } = await register();
+  return { client, tokens: await signIn(client, password) };
 }
 
 function mcpClient(accessToken: string) {
@@ -155,7 +183,7 @@ describe("configuration guards", () => {
   it("compares passwords in constant time and locks out brute force", () => {
     expect(passwordMatches(PASSWORD, PASSWORD)).toBe(true);
     expect(passwordMatches("x", PASSWORD)).toBe(false);
-    const l = new LoginLimiter(3, 10);
+    const l = new LoginLimiter({ maxPerKey: 3 });
     for (let i = 0; i < 3; i++) l.fail("1.2.3.4");
     expect(l.lockedFor("1.2.3.4")).toBeGreaterThan(0);
     expect(l.lockedFor("5.6.7.8")).toBe(0);
@@ -279,16 +307,38 @@ describe("authorization + tokens", () => {
     expect(new URL(page.location!).searchParams.get("error")).toBe("invalid_target");
   });
 
-  it("rotates refresh tokens and revokes the family on reuse", async () => {
+  it("rotates refresh tokens and tolerates a reuse within the 60 s grace window", async () => {
     const { client, tokens } = await connect();
     const creds = { client_id: client.client_id, client_secret: client.client_secret! };
     const r1 = await token({ grant_type: "refresh_token", refresh_token: tokens.refresh_token, ...creds });
     expect(r1.status).toBe(200);
     expect(r1.body.refresh_token).not.toBe(tokens.refresh_token);
-    const reuse = await token({ grant_type: "refresh_token", refresh_token: tokens.refresh_token, ...creds });
-    expect(reuse.body.error).toBe("invalid_grant");
+    // Lost response / concurrent refresh: the old token works once more, the session survives.
+    const again = await token({ grant_type: "refresh_token", refresh_token: tokens.refresh_token, ...creds });
+    expect(again.status).toBe(200);
+    expect(again.body.access_token).toMatch(/^gmm_at_/);
     const r2 = await token({ grant_type: "refresh_token", refresh_token: r1.body.refresh_token, ...creds });
-    expect(r2.body.error).toBe("invalid_grant"); // whole family revoked
+    expect(r2.status).toBe(200);
+    expect(await probe(r2.body.access_token)).toBe(400);
+  });
+
+  it("revokes the whole family when a rotated refresh token is reused after the grace window", async () => {
+    const strict = await start(undefined, { refreshReuseGraceMs: 0 });
+    try {
+      await withServer(strict, async () => {
+        const { client, tokens } = await connect();
+        const creds = { client_id: client.client_id, client_secret: client.client_secret! };
+        const r1 = await token({ grant_type: "refresh_token", refresh_token: tokens.refresh_token, ...creds });
+        expect(r1.status).toBe(200);
+        const reuse = await token({ grant_type: "refresh_token", refresh_token: tokens.refresh_token, ...creds });
+        expect(reuse.body.error).toBe("invalid_grant");
+        const r2 = await token({ grant_type: "refresh_token", refresh_token: r1.body.refresh_token, ...creds });
+        expect(r2.body.error).toBe("invalid_grant"); // whole family revoked
+        expect(await probe(r1.body.access_token)).toBe(401);
+      });
+    } finally {
+      await strict.close();
+    }
   });
 
   it("answers an unknown client with 401 invalid_client (Claude then re-registers)", async () => {
@@ -372,5 +422,192 @@ describe("MCP over HTTP", () => {
     await client.connect(transport);
     expect((await client.listTools()).tools.length).toBeGreaterThan(5);
     await client.close();
+  });
+});
+
+describe("store, limiter and redirect rules (units)", () => {
+  it("groups IPv6 per /64 and maps v4-mapped addresses to IPv4", () => {
+    expect(ipKey("2001:db8:1:2:aaaa::1")).toBe(ipKey("2001:db8:1:2:bbbb:cccc:dddd:2"));
+    expect(ipKey("2001:db8:1:2::1")).not.toBe(ipKey("2001:db8:1:3::1"));
+    expect(ipKey("2001:0db8:0001:0002:0000:0000:0000:0001")).toBe(ipKey("2001:db8:1:2::1"));
+    expect(ipKey("::ffff:203.0.113.9")).toBe("203.0.113.9");
+    expect(ipKey("203.0.113.9")).toBe("203.0.113.9");
+    expect(ipKey("fe80::1%eth0")).toBe(ipKey("fe80::2"));
+  });
+
+  it("locks per IP / per /64 with backoff, never globally", () => {
+    const l = new LoginLimiter({ maxPerKey: 2, globalSoftThreshold: 4, globalMaxDelayMs: 500, baseLockMs: 1000 });
+    for (let i = 0; i < 2; i++) l.fail("2001:db8:5:6::1");
+    expect(l.lockedFor("2001:db8:5:6:ffff::9")).toBeGreaterThan(0); // same /64
+    expect(l.lockedFor("2001:db8:5:7::1")).toBe(0);
+    for (let i = 0; i < 20; i++) l.fail(`198.51.100.${i}`);
+    expect(l.lockedFor("192.0.2.200")).toBe(0); // the owner's fresh address is never refused
+    expect(l.globalDelayMs()).toBe(500); // only a bounded slowdown
+    // Exponential backoff: the second lock of the same key lasts longer.
+    const first = l.lockedFor("2001:db8:5:6::1");
+    for (let i = 0; i < 2; i++) l.fail("2001:db8:5:6::1");
+    expect(l.lockedFor("2001:db8:5:6::1")).toBeGreaterThan(first);
+  });
+
+  it("matches redirect prefixes only at a path boundary", () => {
+    const rule = "https://app.example.com*";
+    expect(redirectRuleMatches(rule, "https://app.example.com")).toBe(true);
+    expect(redirectRuleMatches(rule, "https://app.example.com/cb")).toBe(true);
+    expect(redirectRuleMatches(rule, "https://app.example.com?x=1")).toBe(true);
+    expect(redirectRuleMatches(rule, "https://app.example.com.evil.net/cb")).toBe(false);
+    expect(redirectRuleMatches(rule, "https://app.example.community/cb")).toBe(false);
+    expect(redirectRuleMatches(rule, "https://app.example.com:8443/cb")).toBe(false);
+    expect(redirectRuleMatches("https://x.example/cb/*", "https://x.example/cb/anything")).toBe(true);
+    expect(redirectRuleMatches("https://x.example/cb/*", "https://x.example/cbx")).toBe(false);
+    expect(redirectRuleMatches("https://x.example/cb", "https://x.example/cb")).toBe(true);
+    expect(redirectRuleMatches("https://x.example/cb", "https://x.example/cb/")).toBe(false);
+    expect(redirectRuleMatches("*", "https://anything.example")).toBe(false);
+  });
+
+  it("re-reads the file changed by another process and never writes revoked tokens back", () => {
+    const dir = writeHome();
+    const a = storeFor(dir);
+    a.putClient({ client_id: "c1", redirect_uris: [CLAUDE_CB] } as never);
+    const t = a.issue({ clientId: "c1", scopes: [], resource: "https://x/mcp" }, { accessMs: 60_000, refreshMs: 60_000 });
+    expect(a.getAccess(t.access)).toBeTruthy();
+    const b = storeFor(dir); // "http-logout" in another process
+    b.revokeAll(false);
+    expect(a.getAccess(t.access)).toBeUndefined();
+    a.issue({ clientId: "c1", scopes: [], resource: "https://x/mcp" }, { accessMs: 60_000, refreshMs: 60_000 }); // a writes again
+    expect(storeFor(dir).getAccess(t.access)).toBeUndefined(); // the revoked token did not come back
+    expect(storeFor(dir).stats().accessTokens).toBe(1);
+  });
+
+  it("revokes all tokens when the access password changes, but not otherwise", () => {
+    const dir = writeHome();
+    const s = storeFor(dir);
+    expect(s.syncPassword("first password 123")).toEqual({ changed: false, revokedTokens: 0 }); // first run: just records it
+    s.putClient({ client_id: "c1", redirect_uris: [CLAUDE_CB] } as never);
+    const t = s.issue({ clientId: "c1", scopes: [], resource: "https://x/mcp" }, { accessMs: 60_000, refreshMs: 60_000 });
+    expect(storeFor(dir).syncPassword("first password 123")).toEqual({ changed: false, revokedTokens: 0 });
+    expect(storeFor(dir).getAccess(t.access)).toBeTruthy();
+    expect(storeFor(dir).syncPassword("second password 456")).toEqual({ changed: true, revokedTokens: 2 });
+    expect(storeFor(dir).getAccess(t.access)).toBeUndefined();
+    expect(storeFor(dir).getClient("c1")).toBeTruthy(); // clients are kept
+    expect(fs.readFileSync(path.join(dir, "http-auth.json"), "utf8")).not.toContain("second password");
+  });
+
+  it("refresh grace: reuse inside the window works only while the session is alive", () => {
+    const s = storeFor(writeHome());
+    s.putClient({ client_id: "c1", redirect_uris: [CLAUDE_CB] } as never);
+    const t = s.issue({ clientId: "c1", scopes: [], resource: "https://x/mcp" }, { accessMs: 60_000, refreshMs: 60_000 });
+    const first = s.takeRefresh(t.refresh, 60_000);
+    expect(first).toMatchObject({ clientId: "c1" });
+    const next = s.issue({ clientId: "c1", scopes: [], resource: "https://x/mcp", family: t.family }, { accessMs: 60_000, refreshMs: 60_000 });
+    expect(s.takeRefresh(t.refresh, 60_000)).toMatchObject({ clientId: "c1", family: t.family }); // within grace
+    expect(s.takeRefresh(t.refresh, 0)).toBe("reused"); // outside grace: family revoked
+    expect(s.getAccess(next.access)).toBeUndefined();
+    expect(s.takeRefresh(t.refresh, 60_000)).toBe("reused"); // session dead: no grace any more
+  });
+
+  it("evicts only old clients that never got a token", () => {
+    const s = storeFor(writeHome());
+    const now = Math.floor(Date.now() / 1000);
+    s.putClient({ client_id: "old-unused", client_id_issued_at: now - 3600, redirect_uris: [CLAUDE_CB] } as never);
+    s.putClient({ client_id: "old-used", client_id_issued_at: now - 7200, redirect_uris: [CLAUDE_CB] } as never);
+    s.putClient({ client_id: "new-unused", client_id_issued_at: now, redirect_uris: [CLAUDE_CB] } as never);
+    s.issue({ clientId: "old-used", scopes: [], resource: "https://x/mcp" }, { accessMs: 60_000, refreshMs: 60_000 });
+    expect(s.evictUnusedClients(5, 10 * 60_000)).toBe(1);
+    expect(s.getClient("old-unused")).toBeUndefined();
+    expect(s.getClient("old-used")).toBeTruthy();
+    expect(s.getClient("new-unused")).toBeTruthy();
+  });
+});
+
+describe("sign-out and abuse resistance (HTTP)", () => {
+  it("honours http-logout run from another process immediately", async () => {
+    const { tokens } = await connect();
+    expect(await probe(tokens.access_token)).toBe(400);
+    const r = storeFor().revokeAll(false); // what `gmail-mcp-multi http-logout` does
+    expect(r.tokens).toBeGreaterThan(0);
+    expect(await probe(tokens.access_token)).toBe(401);
+    const fresh = await connect(); // the running server writes the file again...
+    expect(await probe(fresh.tokens.access_token)).toBe(400);
+    expect(await probe(tokens.access_token)).toBe(401); // ...without resurrecting revoked tokens
+    expect(storeFor().getAccess(tokens.access_token)).toBeUndefined();
+  });
+
+  it("changing the access password signs everything out", async () => {
+    const { tokens } = await connect();
+    expect(await probe(tokens.access_token)).toBe(400);
+    const other = await start(undefined, { password: "a completely new password" });
+    try {
+      // The new server revoked every token at startup; the old server sees it too.
+      expect(await probe(tokens.access_token)).toBe(401);
+      await withServer(other, async () => {
+        expect(await probe(tokens.access_token)).toBe(401);
+        const again = await connect("a completely new password");
+        expect(await probe(again.tokens.access_token)).toBe(400);
+      });
+    } finally {
+      await other.close();
+      storeFor().syncPassword(PASSWORD); // restore the fingerprint for the remaining tests
+    }
+  });
+
+  it("locks the attacking IP or IPv6 /64 but never refuses the right password from elsewhere", async () => {
+    const limited = await start(undefined, { failureDelayMs: 0, limiter: new LoginLimiter({ globalSoftThreshold: 5, globalMaxDelayMs: 50 }) });
+    try {
+      await withServer(limited, async () => {
+        const { body: client } = await register();
+        const page = await openLogin(client.client_id, pkce().challenge);
+        const started = Date.now();
+        // 6 IPv4 attackers x 5 attempts = 30 failures (the old global lock was 25).
+        for (let a = 1; a <= 6; a++) for (let i = 0; i < 5; i++) expect((await approve(page, "wrong password!!", "approve", page.cookie, `203.0.113.${a}`)).status).toBe(401);
+        for (let i = 0; i < 5; i++) await approve(page, "wrong password!!", "approve", page.cookie, `2001:db8:1:2::${i + 1}`);
+        expect(Date.now() - started).toBeLessThan(10_000); // bounded slowdown, not a lock
+        expect((await approve(page, PASSWORD, "approve", page.cookie, "203.0.113.1")).status).toBe(429);
+        expect((await approve(page, PASSWORD, "approve", page.cookie, "2001:db8:1:2:dead:beef::1")).status).toBe(429); // same /64
+        const ok = await approve(page, PASSWORD, "approve", page.cookie, "198.51.100.7");
+        expect(ok.status).toBe(302);
+        const page2 = await openLogin(client.client_id, pkce().challenge);
+        expect((await approve(page2, PASSWORD, "approve", page2.cookie, "2001:db8:1:3::1")).status).toBe(302); // next /64 is fine
+      });
+    } finally {
+      await limited.close();
+    }
+  });
+
+  it("evicts never-used clients when the registration cap is reached", async () => {
+    const dir = writeHome();
+    const capped = await start(undefined, { maxClients: 3, clientEvictMinAgeMs: 0 }, dir);
+    try {
+      await withServer(capped, async () => {
+        const ids: string[] = [];
+        for (let i = 0; i < 3; i++) ids.push((await register()).body.client_id);
+        const fourth = await register();
+        expect(fourth.status).toBe(201);
+        expect(storeFor(dir).clientCount()).toBe(3);
+        expect(storeFor(dir).getClient(ids[0])).toBeUndefined(); // the oldest unused one made room
+        // Once every client has signed in, nothing is evictable and the cap holds.
+        for (const id of [ids[1], ids[2], fourth.body.client_id]) {
+          const c = storeFor(dir).getClient(id)!;
+          await signIn(c as { client_id: string; client_secret?: string });
+        }
+        const fifth = await register();
+        expect(fifth.status).toBe(400);
+        expect(fifth.body.error).toBe("invalid_client_metadata");
+      });
+    } finally {
+      await capped.close();
+    }
+  });
+
+  it("shares one mail registry across sessions", async () => {
+    const a = await connect();
+    const c1 = mcpClient(a.tokens.access_token);
+    const c2 = mcpClient(a.tokens.access_token);
+    await c1.client.connect(c1.transport);
+    await c2.client.connect(c2.transport);
+    const ctxs = [...srv.sessions.values()].map((s) => s.ctx);
+    expect(ctxs.length).toBeGreaterThanOrEqual(2);
+    for (const ctx of ctxs) expect(ctx.mail).toBe(srv.mail);
+    await c1.client.close();
+    await c2.client.close();
   });
 });

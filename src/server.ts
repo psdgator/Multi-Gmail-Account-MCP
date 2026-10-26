@@ -53,6 +53,9 @@ function instructions(ctx: ToolContext): string {
 export interface ServerOptions {
   transport?: "stdio" | "http";
   accounts?: AccountManager;
+  /** Share one provider registry (and its IMAP connections) between servers, e.g. HTTP sessions. */
+  mail?: MailRegistry;
+  audit?: AuditLog;
 }
 
 export function createServer(mode: Mode, opts: ServerOptions = {}): { server: McpServer; ctx: ToolContext } {
@@ -61,9 +64,9 @@ export function createServer(mode: Mode, opts: ServerOptions = {}): { server: Mc
   if (migrated.length) console.error(`[gmail-mcp-multi] encrypted stored credentials for: ${migrated.join(", ")}`);
   const ctx: ToolContext = {
     accounts,
-    mail: new MailRegistry(accounts),
+    mail: opts.mail ?? new MailRegistry(accounts),
     mode,
-    audit: new AuditLog(accounts.root),
+    audit: opts.audit ?? new AuditLog(accounts.root),
     transport: opts.transport ?? "stdio",
     pendingAuth: new Map(),
     onAccountsChanged: new Set(),

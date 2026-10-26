@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import * as net from "node:net";
 import express, { Request, Response, Router } from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import {
@@ -19,12 +20,13 @@ import { AuthStore } from "./auth-store.js";
  * - Clients register dynamically (claude.ai does this), but only with redirect
  *   URIs on the allow-list (Claude's callback and loopback by default).
  * - The authorization step shows a page asking for the server's access
- *   password (GMAIL_MCP_HTTP_PASSWORD). Wrong passwords are rate-limited and
- *   locked out per IP and globally.
+ *   password (GMAIL_MCP_HTTP_PASSWORD). Wrong passwords lock out the offending
+ *   IP (IPv6: its /64) with exponential backoff; many failures overall only add
+ *   a short delay, so the owner is never locked out by other people's attempts.
  * - Codes are single-use and live 5 minutes; PKCE S256 is enforced by the SDK.
  * - Access tokens (1 h) and rotating refresh tokens (30 d) are random 256-bit
  *   strings stored only as hashes; reusing a rotated refresh token revokes the
- *   whole token family.
+ *   whole token family (after a 60 s grace window for lost responses).
  */
 
 export const CLAUDE_CALLBACKS = ["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback"];
@@ -42,7 +44,14 @@ export interface ProviderOptions {
   secureCookies: boolean;
   accessTtlMs?: number;
   refreshTtlMs?: number;
+  /** Rotated refresh tokens are still accepted this long (default 60 s). */
+  refreshReuseGraceMs?: number;
   maxClients?: number;
+  /** Unused clients younger than this are never evicted to make room (default 10 min). */
+  clientEvictMinAgeMs?: number;
+  /** Extra delay on every wrong password (default 400 ms). */
+  failureDelayMs?: number;
+  limiter?: LoginLimiter;
   /** Shown on the login page. */
   serverName?: string;
 }
@@ -79,53 +88,122 @@ function normalizeResource(u: string | URL): string {
   return s.replace(/#.*$/, "").replace(/\/$/, "");
 }
 
-/** Per-IP and global brute-force protection for the password form. */
-export class LoginLimiter {
-  private perIp = new Map<string, { fails: number; first: number; lockedUntil: number }>();
-  private global = { fails: 0, first: 0, lockedUntil: 0 };
+/** Expand an IPv6 address to 8 hextets (embedded IPv4 and zone ids handled). */
+function ipv6Groups(addr: string): string[] {
+  let s = addr.split("%")[0];
+  const v4 = s.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (v4) {
+    const [a, b, c, d] = v4[2].split(".").map(Number);
+    s = `${v4[1]}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const [head, tail] = s.includes("::") ? s.split("::") : [s, undefined];
+  const h = head ? head.split(":") : [];
+  const t = tail !== undefined && tail !== "" ? tail.split(":") : [];
+  const fill = tail !== undefined ? Array(Math.max(0, 8 - h.length - t.length)).fill("0") : [];
+  return [...h, ...fill, ...t].map((g) => parseInt(g || "0", 16).toString(16));
+}
 
-  constructor(
-    private readonly maxPerIp = 5,
-    private readonly maxGlobal = 25,
-    private readonly windowMs = 15 * 60_000,
-    private readonly lockMs = 15 * 60_000
-  ) {}
+/**
+ * The unit a lockout applies to: an IPv4 address, or an IPv6 /64 (one
+ * customer's whole allocation, so rotating addresses inside it doesn't help).
+ */
+export function ipKey(ip: string): string {
+  const a = ip.trim();
+  if (/^::ffff:/i.test(a) && net.isIPv4(a.slice(7))) return a.slice(7);
+  if (net.isIPv6(a.split("%")[0])) return `${ipv6Groups(a).slice(0, 4).join(":")}::/64`;
+  return a;
+}
+
+export interface LoginLimiterOptions {
+  /** Wrong passwords (per IP / IPv6 /64) within the window before a lock. */
+  maxPerKey: number;
+  windowMs: number;
+  /** First lock duration; doubles with every further lock, up to maxLockMs. */
+  baseLockMs: number;
+  maxLockMs: number;
+  /** Failures (all sources, within the window) before the soft global delay starts. */
+  globalSoftThreshold: number;
+  /** Cap of the soft global delay added to each attempt. */
+  globalMaxDelayMs: number;
+}
+
+const LIMITER_DEFAULTS: LoginLimiterOptions = {
+  maxPerKey: 5,
+  windowMs: 15 * 60_000,
+  baseLockMs: 5 * 60_000,
+  maxLockMs: 60 * 60_000,
+  globalSoftThreshold: 20,
+  globalMaxDelayMs: 2000,
+};
+
+/**
+ * Brute-force protection for the password form.
+ *
+ * Locks are per IP (IPv6 per /64) with exponential backoff. There is no global
+ * lock: failures from many sources only add a bounded delay to every attempt, so
+ * the correct password from the owner's address is never refused.
+ */
+export class LoginLimiter {
+  private perKey = new Map<string, { fails: number; first: number; lockedUntil: number; locks: number; last: number }>();
+  private globalFails: number[] = [];
+  readonly o: LoginLimiterOptions;
+
+  constructor(opts: Partial<LoginLimiterOptions> = {}) {
+    this.o = { ...LIMITER_DEFAULTS, ...opts };
+  }
 
   lockedFor(ip: string): number {
+    const e = this.perKey.get(ipKey(ip));
     const now = Date.now();
-    const g = this.global.lockedUntil > now ? this.global.lockedUntil - now : 0;
-    const e = this.perIp.get(ip);
-    const p = e && e.lockedUntil > now ? e.lockedUntil - now : 0;
-    return Math.max(g, p);
+    return e && e.lockedUntil > now ? e.lockedUntil - now : 0;
+  }
+
+  /** Soft delay to add to every attempt while many failures are happening overall. */
+  globalDelayMs(): number {
+    const now = Date.now();
+    while (this.globalFails.length && now - this.globalFails[0] > this.o.windowMs) this.globalFails.shift();
+    const over = this.globalFails.length - this.o.globalSoftThreshold;
+    return over > 0 ? Math.min(this.o.globalMaxDelayMs, over * 100) : 0;
   }
 
   fail(ip: string): void {
     const now = Date.now();
-    const e = this.perIp.get(ip) ?? { fails: 0, first: now, lockedUntil: 0 };
-    if (now - e.first > this.windowMs) Object.assign(e, { fails: 0, first: now });
+    const key = ipKey(ip);
+    const e = this.perKey.get(key) ?? { fails: 0, first: now, lockedUntil: 0, locks: 0, last: now };
+    if (now - e.last > 24 * 3600_000) e.locks = 0; // a quiet day forgets earlier locks
+    if (now - e.first > this.o.windowMs) Object.assign(e, { fails: 0, first: now });
     e.fails++;
-    if (e.fails >= this.maxPerIp) e.lockedUntil = now + this.lockMs;
-    this.perIp.set(ip, e);
-    if (now - this.global.first > this.windowMs) Object.assign(this.global, { fails: 0, first: now });
-    this.global.fails++;
-    if (this.global.fails >= this.maxGlobal) this.global.lockedUntil = now + this.lockMs;
+    e.last = now;
+    if (e.fails >= this.o.maxPerKey) {
+      e.lockedUntil = now + Math.min(this.o.maxLockMs, this.o.baseLockMs * 2 ** e.locks);
+      e.locks++;
+      e.fails = 0;
+      e.first = now;
+    }
+    this.perKey.set(key, e);
+    this.globalFails.push(now);
+    if (this.globalFails.length > 10_000) this.globalFails.splice(0, this.globalFails.length - 10_000);
+    if (this.perKey.size > 10_000) {
+      for (const [k, v] of this.perKey) if (v.lockedUntil <= now && now - v.last > this.o.windowMs) this.perKey.delete(k);
+    }
   }
 
   succeed(ip: string): void {
-    this.perIp.delete(ip);
+    this.perKey.delete(ipKey(ip));
   }
 }
 
 export class PasswordOAuthProvider implements OAuthServerProvider {
   private pending = new Map<string, Pending>();
   private codes = new Map<string, CodeRecord>();
-  readonly limiter = new LoginLimiter();
+  readonly limiter: LoginLimiter;
   private readonly accessTtlMs: number;
   private readonly refreshTtlMs: number;
 
   constructor(private readonly opts: ProviderOptions) {
     this.accessTtlMs = opts.accessTtlMs ?? 60 * 60_000;
     this.refreshTtlMs = opts.refreshTtlMs ?? 30 * 24 * 3600_000;
+    this.limiter = opts.limiter ?? new LoginLimiter();
     setInterval(() => this.sweep(), 60_000).unref();
   }
 
@@ -145,7 +223,7 @@ export class PasswordOAuthProvider implements OAuthServerProvider {
     if (u.hash) return false;
     if (this.opts.allowLoopbackRedirects && u.protocol === "http:" && LOOPBACK.has(u.hostname)) return true;
     if (u.protocol !== "https:") return false;
-    return this.opts.allowedRedirects.some((rule) => (rule.endsWith("*") ? uri.startsWith(rule.slice(0, -1)) : uri === rule));
+    return this.opts.allowedRedirects.some((rule) => redirectRuleMatches(rule, uri));
   }
 
   get clientsStore(): OAuthRegisteredClientsStore {
@@ -161,8 +239,14 @@ export class PasswordOAuthProvider implements OAuthServerProvider {
             `redirect_uri not allowed by this server: ${bad.join(", ") || "(none given)"}. Allowed: ${this.opts.allowedRedirects.join(", ")}${this.opts.allowLoopbackRedirects ? ", http://localhost/127.0.0.1 (any port)" : ""}`
           );
         }
-        if (this.opts.store.clientCount() >= (this.opts.maxClients ?? 100)) {
-          throw new InvalidClientMetadataError("Too many registered clients. Run `gmail-mcp-multi http-logout --clients` on the server.");
+        const max = this.opts.maxClients ?? 100;
+        const count = this.opts.store.clientCount();
+        if (count >= max) {
+          // Make room by dropping clients that registered but never completed a sign-in.
+          this.opts.store.evictUnusedClients(count - max + 1, this.opts.clientEvictMinAgeMs ?? 10 * 60_000);
+          if (this.opts.store.clientCount() >= max) {
+            throw new InvalidClientMetadataError("Too many registered clients. Run `gmail-mcp-multi http-logout --clients` on the server.");
+          }
         }
         this.opts.store.putClient(full);
         return full;
@@ -264,6 +348,9 @@ ${v.error ? `<p role="alert" style="color:#b91c1c;margin:0 0 12px">${escapeHtml(
         this.redirectWith(res, p.params.redirectUri, { error: "access_denied", error_description: "The user denied access", state: p.params.state });
         return;
       }
+      // Soft slowdown while many wrong passwords are arriving overall (never a refusal).
+      const slow = this.limiter.globalDelayMs();
+      if (slow > 0) await new Promise((r) => setTimeout(r, slow));
       const locked = this.limiter.lockedFor(ip);
       if (locked > 0) {
         this.renderLogin(res, { id: body.request, csrf: p.csrf, client, redirectUri: p.params.redirectUri, status: 429, error: `Too many wrong passwords. Try again in ${Math.ceil(locked / 60_000)} minutes.` });
@@ -271,7 +358,8 @@ ${v.error ? `<p role="alert" style="color:#b91c1c;margin:0 0 12px">${escapeHtml(
       }
       if (typeof body.password !== "string" || !passwordMatches(body.password, this.opts.password)) {
         this.limiter.fail(ip);
-        await new Promise((r) => setTimeout(r, 400));
+        const delay = this.opts.failureDelayMs ?? 400;
+        if (delay > 0) await new Promise((r) => setTimeout(r, delay));
         this.renderLogin(res, { id: body.request, csrf: p.csrf, client, redirectUri: p.params.redirectUri, status: 401, error: "Wrong password." });
         return;
       }
@@ -326,7 +414,7 @@ ${v.error ? `<p role="alert" style="color:#b91c1c;margin:0 0 12px">${escapeHtml(
 
   async exchangeRefreshToken(client: OAuthClientInformationFull, refreshToken: string, scopes?: string[], resource?: URL): Promise<OAuthTokens> {
     if (resource && normalizeResource(resource) !== normalizeResource(this.opts.resource)) throw new InvalidTargetError("Wrong resource");
-    const rec = this.opts.store.takeRefresh(refreshToken);
+    const rec = this.opts.store.takeRefresh(refreshToken, this.opts.refreshReuseGraceMs ?? 60_000);
     if (rec === "reused") throw new InvalidGrantError("Refresh token reuse detected; all tokens of this session were revoked. Reconnect.");
     if (!rec || rec.clientId !== client.client_id) throw new InvalidGrantError("Invalid refresh token");
     const granted = scopes?.length ? scopes.filter((s) => rec.scopes.includes(s)) : rec.scopes;
@@ -346,6 +434,21 @@ ${v.error ? `<p role="alert" style="color:#b91c1c;margin:0 0 12px">${escapeHtml(
   async revokeToken(client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {
     this.opts.store.revoke(client.client_id, request.token);
   }
+}
+
+/**
+ * Redirect allow-list rule: an exact URI, or a prefix ending in "*". A prefix
+ * only matches at a boundary: either the prefix itself ends with "/", or the
+ * next character is "/", "?" or "#" (or the URI ends), so
+ * "https://app.example.com*" does not match "https://app.example.com.evil.net".
+ */
+export function redirectRuleMatches(rule: string, uri: string): boolean {
+  if (!rule.endsWith("*")) return uri === rule;
+  const prefix = rule.slice(0, -1);
+  if (!prefix || !uri.startsWith(prefix)) return false;
+  if (prefix.endsWith("/")) return true;
+  const next = uri.charAt(prefix.length);
+  return next === "" || next === "/" || next === "?" || next === "#";
 }
 
 export function parseCookie(header: string, name: string): string | undefined {
