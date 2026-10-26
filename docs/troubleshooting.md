@@ -22,6 +22,8 @@ Start with `gmail-mcp-multi doctor`. It checks the OAuth client file, the encryp
 | `This search can't be applied exactly on "x"` | `bulk_cleanup` refuses queries the mailbox can't apply exactly (IMAP and Gmail-only operators). Rephrase without the listed parts. |
 | `encrypted with a different key` / `Not creating a new key over existing encrypted logins` | The encryption key is missing or different (new machine, keychain reset, changed `GMAIL_MCP_MASTER_KEY`). Restore it, or remove and reconnect the accounts. |
 | `IMAP login failed for "x"` | Wrong password or login name. Run `gmail-mcp-multi add-imap x …` again. See [IMAP](imap.md). |
+| `… this server has no UIDPLUS …` (IMAP) | Another mail app left messages marked deleted in that folder, and the server can't remove just one. Empty that folder's deleted messages in your mail app (often "Compact" or "Expunge"), then try again. |
+| `… is the All Mail folder …` (IMAP) | Moving mail out of All Mail would delete it. Act on it from INBOX or its label folder instead. |
 | `Calendar access is not enabled for "x"` | Reconnect with `--calendar` ([Calendar](calendar.md)). |
 | Search finds nothing on an IMAP account | IMAP searches INBOX by default; add `in:anywhere`. Gmail-only operators like `category:` are ignored. |
 | `pageToken only works when searching a single account` | Name one account when paging through results. |

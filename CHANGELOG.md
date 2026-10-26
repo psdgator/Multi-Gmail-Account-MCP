@@ -28,9 +28,11 @@ First release as **multi-gmail-account-mcp** (fork of dmorrill/gmail-mcp-multi).
   - IMAP refuses the matching folders.
 - **IMAP drafts:**
   - `delete_draft` / `send_draft` only act on real drafts.
-  - A sent draft whose clean-up fails reports a warning instead of risking a second send.
+  - A sent draft whose clean-up fails reports a warning instead of risking a second send, and is never sent again.
+- **IMAP folders:** localised Trash/Junk/Drafts/Sent/All Mail names are protected; mail can't be moved out of All Mail or Drafts; deletes use `UID EXPUNGE`, and on servers without UIDPLUS nothing is expunged if another app left messages marked deleted in that folder.
 - **Query handling:**
   - IMAP queries report the parts they can't apply.
+  - IMAP `from:`/`to:`/`cc:`/`bcc:` with a full address match that exact address (not look-alikes); `after:`/`before:` timestamps, negated `older_than:` and grouped `newer_than:` are applied exactly; `rfc822msgid:` works; queries with no usable terms (`OR`, `-`, `()`) are refused instead of matching everything.
   - `bulk_cleanup` refuses such queries, and asks you directly through MCP elicitation when the client supports it.
 - **Local files:**
   - reading and writing is limited to allowed folders (no hidden, app-data/startup, config, system or network paths); hosted mode has no local file access
