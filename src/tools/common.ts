@@ -1,4 +1,4 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer, RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { AccountConfig, AccountManager } from "../accounts.js";
@@ -8,6 +8,10 @@ import type { AuthFlow } from "../oauth.js";
 import type { MailRegistry } from "../providers/registry.js";
 
 export interface ToolContext {
+  /** The MCP server (for asking the user to confirm via elicitation, list-changed notifications). */
+  server?: McpServer;
+  /** Called after accounts change (e.g. calendar access granted) so tool lists can update. */
+  onAccountsChanged: Set<() => void>;
   accounts: AccountManager;
   mail: MailRegistry;
   /** The server-wide ceiling chosen at startup (--mode). */
@@ -62,6 +66,29 @@ export function singleAccountArg(ctx: ToolContext) {
     .describe(`Account alias or email address. Omit to use the default account. ${accountList(ctx)}`);
 }
 
+/**
+ * Ask the human to confirm an action through the MCP client (elicitation), when the
+ * client supports it. Returns "unsupported" when it doesn't; callers then rely on
+ * their own preview/confirm-token flow.
+ */
+export async function confirmWithUser(ctx: ToolContext, message: string): Promise<"accepted" | "declined" | "unsupported"> {
+  const inner = ctx.server?.server;
+  if (!inner?.getClientCapabilities()?.elicitation) return "unsupported";
+  try {
+    const r = await inner.elicitInput({
+      message,
+      requestedSchema: {
+        type: "object",
+        properties: { confirm: { type: "boolean", title: "Yes, do it", description: message } },
+        required: ["confirm"],
+      },
+    } as never);
+    return r.action === "accept" && (r.content as { confirm?: boolean } | undefined)?.confirm === true ? "accepted" : "declined";
+  } catch {
+    return "unsupported";
+  }
+}
+
 /** A tool result that is not JSON (e.g. an image for Claude to look at). */
 export class RawResult {
   constructor(readonly result: CallToolResult) {}
@@ -86,11 +113,11 @@ function accountsIn(args: Record<string, unknown> | undefined): string[] | undef
   return Array.isArray(a) ? a.map(String) : String(a).split(",").map((s) => s.trim());
 }
 
-export function register<Shape extends z.ZodRawShape>(server: McpServer, ctx: ToolContext, def: ToolDef<Shape>): boolean {
-  if (!modeAllows(ctx.mode, def.minMode)) return false;
-  if (def.when && !def.when(ctx)) return false;
+export function register<Shape extends z.ZodRawShape>(server: McpServer, ctx: ToolContext, def: ToolDef<Shape>): RegisteredTool | undefined {
+  if (!modeAllows(ctx.mode, def.minMode)) return undefined;
+  if (def.when && !def.when(ctx)) return undefined;
   if (def.annotations?.readOnlyHint) READ_ONLY_TOOLS.add(def.name);
-  server.registerTool(
+  return server.registerTool(
     def.name,
     {
       title: def.title,
@@ -112,7 +139,6 @@ export function register<Shape extends z.ZodRawShape>(server: McpServer, ctx: To
       }
     }) as never
   );
-  return true;
 }
 
 export const READ_ONLY: ToolAnnotations = { readOnlyHint: true, destructiveHint: false, openWorldHint: true };

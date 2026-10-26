@@ -73,6 +73,7 @@ export function registerAccountTools(server: McpServer, ctx: ToolContext): void 
           ctx.mail.forget(a);
           entry.result = `connected ${r.email}`;
           ctx.pendingAuth.delete(a);
+          for (const cb of ctx.onAccountsChanged) cb();
         })
         .catch((err) => {
           entry.result = `failed: ${(err as Error).message}`;

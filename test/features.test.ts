@@ -246,3 +246,94 @@ describe("full mode features", () => {
     expect(fake.requests.some((x) => x.includes("sendUpdates=all"))).toBe(false);
   });
 });
+
+describe("security fixes (review)", () => {
+  let client: Client;
+  beforeAll(async () => {
+    client = await connect("drafts");
+  });
+  afterAll(async () => {
+    await client.close();
+  });
+
+  it("drafts mode can't trash or spam mail through system labels", async () => {
+    for (const label of ["Trash", "TRASH", "spam", "SENT", "DRAFT"]) {
+      const r = await call(client, "modify_emails", { account: "urbanstickers", messageIds: ["u2"], addLabels: [label] });
+      expect(r.error).toMatch(/can't be added or removed/);
+    }
+    const rm = await call(client, "modify_emails", { account: "urbanstickers", messageIds: ["u2"], removeLabels: ["INBOX", "TRASH"] });
+    expect(rm.error).toMatch(/can't be added or removed/);
+    const prev = await call(client, "bulk_cleanup", { account: "urbanstickers", query: "from:shop@example.com", action: "label", label: "TRASH" });
+    expect(prev.matches).toBe(1);
+    const run = await call(client, "bulk_cleanup", { account: "urbanstickers", query: "from:shop@example.com", action: "label", label: "TRASH", dryRun: false, confirmToken: prev.confirmToken });
+    expect(run.error).toMatch(/can't be added or removed/);
+    expect(fake.boxes["tok-urban"].messages.find((m) => m.id === "u2")!.labelIds).not.toContain("TRASH");
+  });
+
+  it("asks the human through elicitation when the client supports it", async () => {
+    const { ElicitRequestSchema } = await import("@modelcontextprotocol/sdk/types.js");
+    let answer: "decline" | "accept" = "decline";
+    const asked: string[] = [];
+    const c = new Client({ name: "elicit", version: "1" }, { capabilities: { elicitation: {} } });
+    c.setRequestHandler(ElicitRequestSchema, async (req) => {
+      asked.push((req.params as { message: string }).message);
+      return answer === "accept" ? { action: "accept", content: { confirm: true } } : { action: "decline" };
+    });
+    await c.connect(
+      new StdioClientTransport({
+        command: process.execPath,
+        args: [ENTRY, "--mode", "drafts"],
+        env: { ...process.env, GMAIL_MCP_HOME: home, GMAIL_MCP_API_ROOT: fake.url, GMAIL_MCP_MASTER_KEY: KEY } as Record<string, string>,
+        stderr: "pipe",
+      })
+    );
+    const args = { account: "urbanstickers", query: "from:shop@example.com", action: "markRead" };
+    const prev = await call(c, "bulk_cleanup", args);
+    const declined = await call(c, "bulk_cleanup", { ...args, dryRun: false, confirmToken: prev.confirmToken });
+    expect(declined).toMatchObject({ changed: 0, cancelled: "The user declined." });
+    expect(asked[0]).toMatch(/Mark as read 1 email\(s\) in "urbanstickers"/);
+    answer = "accept";
+    const done = await call(c, "bulk_cleanup", { ...args, dryRun: false, confirmToken: prev.confirmToken });
+    expect(done.changed).toBe(1);
+    await c.close();
+  });
+
+  it("find_free_time starts on the requested local day even in the afternoon", async () => {
+    const tomorrow = new Date(Date.now() + 86_400_000);
+    const ymd = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Athens" }).format(tomorrow);
+    const r = await call(client, "find_free_time", { from: `${ymd}T15:00`, days: 1, includeWeekends: true });
+    expect(r.freeSlots[0].day).toBe(ymd);
+    expect(Date.parse(r.freeSlots[0].start)).toBeGreaterThanOrEqual(Date.parse(`${ymd}T15:00:00+02:00`) - 3_600_000);
+  });
+});
+
+describe("full mode safety (review)", () => {
+  let client: Client;
+  beforeAll(async () => {
+    client = await connect("full");
+  });
+  afterAll(async () => {
+    await client.close();
+  });
+
+  it("unsubscribe mailto: one address only, fixed short body, From set", async () => {
+    const box = fake.boxes["tok-urban"];
+    box.messages.push({
+      id: "evil1",
+      threadId: "tevil1",
+      internalDate: String(Date.now() - 3600_000),
+      labelIds: [],
+      snippet: "x",
+      payload: { mimeType: "text/plain", headers: [{ name: "From", value: "x@evil.example" }, { name: "Subject", value: "hi" }, { name: "List-Unsubscribe", value: "<mailto:a@victim.example,b@victim.example?body=Please wire money>" }] },
+    });
+    const multi = await call(client, "unsubscribe", { messageId: "evil1", account: "urbanstickers" });
+    expect(multi.error).toMatch(/not a single valid email address/);
+    box.messages.at(-1)!.payload.headers = [{ name: "From", value: "x@evil.example" }, { name: "Subject", value: "hi" }, { name: "List-Unsubscribe", value: "<mailto:unsub@evil.example?subject=Invoice%20attached&body=Please%20wire%20money>" }];
+    const before = box.sent.length;
+    const ok = await call(client, "unsubscribe", { messageId: "evil1", account: "urbanstickers" });
+    expect(ok).toMatchObject({ method: "email", sentTo: "unsub@evil.example" });
+    const parsed = await simpleParser(Buffer.from(box.sent[before].raw, "base64url").toString("utf8"));
+    expect(parsed.text?.trim()).toBe("unsubscribe");
+    expect(parsed.from?.value[0].address).toBe("urbanstickersgr@gmail.com");
+  });
+});

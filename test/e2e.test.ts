@@ -43,7 +43,7 @@ async function connect(mode: string): Promise<Client> {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [ENTRY, "--mode", mode],
-    env: { ...process.env, GMAIL_MCP_HOME: home, GMAIL_MCP_API_ROOT: fake.url, GMAIL_MCP_NO_BROWSER: "1", GMAIL_MCP_MASTER_KEY: TEST_KEY } as Record<string, string>,
+    env: { ...process.env, GMAIL_MCP_HOME: home, GMAIL_MCP_API_ROOT: fake.url, GMAIL_MCP_NO_BROWSER: "1", GMAIL_MCP_MASTER_KEY: TEST_KEY, GMAIL_MCP_ALLOWED_DIRS: os.tmpdir() } as Record<string, string>,
     stderr: "pipe",
   });
   const client = new Client({ name: "e2e", version: "1.0.0" });

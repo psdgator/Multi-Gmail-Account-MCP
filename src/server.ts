@@ -66,8 +66,10 @@ export function createServer(mode: Mode, opts: ServerOptions = {}): { server: Mc
     audit: new AuditLog(accounts.root),
     transport: opts.transport ?? "stdio",
     pendingAuth: new Map(),
+    onAccountsChanged: new Set(),
   };
   const server = new McpServer({ name: "gmail-mcp-multi", version: VERSION }, { instructions: instructions(ctx) });
+  ctx.server = server;
   for (const group of toolGroups) group(server, ctx);
   return { server, ctx };
 }

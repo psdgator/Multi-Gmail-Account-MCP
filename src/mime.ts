@@ -1,7 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { expandHome } from "./config.js";
+import { checkPath } from "./paths.js";
 
 /** Builds RFC 5322 / MIME messages for drafts and sending. UTF-8 safe (Greek etc.). */
 
@@ -60,10 +60,8 @@ export function loadAttachments(paths: string[] | undefined): Attachment[] {
   if (!paths?.length) return [];
   let total = 0;
   return paths.map((p) => {
-    const full = path.resolve(expandHome(p));
-    if (!fs.existsSync(full) || !fs.statSync(full).isFile()) {
-      throw new Error(`Attachment not found: ${p}`);
-    }
+    // Only files in allowed folders (home, GMAIL_MCP_ALLOWED_DIRS), never hidden/system/config files.
+    const full = checkPath(p, "read");
     const content = fs.readFileSync(full);
     total += content.length;
     if (total > MAX_ATTACHMENT_BYTES) {
@@ -137,7 +135,11 @@ export function splitAddresses(list: string | string[] | undefined): string[] {
     }
     if (cur.trim()) out.push(cur.trim());
   }
-  return out;
+  // RFC 5322 group syntax ("undisclosed-recipients:;", "Team: a@x, b@y;"): drop the group
+  // label and keep only real addresses.
+  return out
+    .map((a) => a.replace(/^[^"<>@:]*:\s*/, "").replace(/;\s*$/, "").trim())
+    .filter((a) => a.includes("@"));
 }
 
 const wrap76 = (b64: string) => b64.replace(/.{1,76}/g, "$&\r\n").replace(/\r\n$/, "");

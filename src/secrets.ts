@@ -23,6 +23,8 @@ const SERVICE = "gmail-mcp-multi";
 interface Envelope {
   v: 1;
   alg: "A256GCM";
+  /** Key fingerprint (not secret) to tell "wrong key" from "corrupted". */
+  kid?: string;
   iv: string;
   tag: string;
   data: string;
@@ -66,6 +68,16 @@ export class SecretStore {
     return `master-key:${crypto.createHash("sha256").update(path.resolve(this.root)).digest("hex").slice(0, 16)}`;
   }
 
+  /** Any credential already encrypted under this config folder? Then a new key must never be created. */
+  private encryptedFilesExist(): boolean {
+    const candidates = [path.join(this.root, "http-auth.json")];
+    const accDir = path.join(this.root, "accounts");
+    if (fs.existsSync(accDir)) {
+      for (const a of fs.readdirSync(accDir)) candidates.push(path.join(accDir, a, "credentials.json"));
+    }
+    return candidates.some((f) => fs.existsSync(f) && this.isEncrypted(f));
+  }
+
   private masterKey(): Buffer {
     if (this.key) return this.key;
     const env = process.env.GMAIL_MCP_MASTER_KEY;
@@ -75,15 +87,42 @@ export class SecretStore {
       return this.key;
     }
 
+    // An existing key file wins over the keychain, so the key source can't silently flip
+    // (e.g. when keychain support becomes available after the file was created).
+    const keyFile = path.join(this.root, "master.key");
+    if (fs.existsSync(keyFile)) {
+      this.key = parseKey(fs.readFileSync(keyFile, "utf8"));
+      this.source = "file";
+      return this.key;
+    }
+
+    const mustNotCreate = this.encryptedFilesExist();
     const entry = keyringEntry(this.keyName());
     if (entry) {
+      let existing: string | null | undefined;
       try {
-        const existing = entry.getPassword();
-        if (existing) {
-          this.key = parseKey(existing);
-          this.source = "keychain";
-          return this.key;
+        existing = entry.getPassword();
+      } catch (err) {
+        if (mustNotCreate) {
+          throw new Error(
+            `Could not read the encryption key from the OS keychain (${(err as Error).message}). Your stored logins need it; not creating a new key. ` +
+              "Fix keychain access, or set GMAIL_MCP_MASTER_KEY, or reconnect the accounts."
+          );
         }
+        existing = undefined;
+      }
+      if (existing) {
+        this.key = parseKey(existing);
+        this.source = "keychain";
+        return this.key;
+      }
+      if (mustNotCreate) {
+        throw new Error(
+          "The encryption key for your stored logins was not found (OS keychain entry missing and no master.key / GMAIL_MCP_MASTER_KEY). " +
+            "Not creating a new key over existing encrypted logins: restore the key, or remove and reconnect the accounts."
+        );
+      }
+      try {
         const fresh = crypto.randomBytes(32);
         entry.setPassword(fresh.toString("base64"));
         // Read back: some backends accept writes but can't persist (no daemon).
@@ -95,29 +134,33 @@ export class SecretStore {
       } catch {
         /* fall through to file */
       }
+    } else if (mustNotCreate) {
+      throw new Error(
+        "The encryption key for your stored logins is not available (no OS keychain support, no master.key, no GMAIL_MCP_MASTER_KEY). Not creating a new key over existing encrypted logins."
+      );
     }
 
     ensureSecureDir(this.root);
-    const keyFile = path.join(this.root, "master.key");
-    if (fs.existsSync(keyFile)) {
-      this.key = parseKey(fs.readFileSync(keyFile, "utf8"));
-    } else {
-      this.key = crypto.randomBytes(32);
-      writeSecureFile(keyFile, this.key.toString("base64") + "\n");
-      console.error(
-        `[gmail-mcp-multi] No OS keychain available; stored the encryption key in ${keyFile} (owner-only). ` +
-          "Set GMAIL_MCP_MASTER_KEY to keep it elsewhere."
-      );
-    }
+    this.key = crypto.randomBytes(32);
+    writeSecureFile(keyFile, this.key.toString("base64") + "\n");
+    console.error(
+      `[gmail-mcp-multi] No OS keychain available; stored the encryption key in ${keyFile} (owner-only). ` +
+        "Set GMAIL_MCP_MASTER_KEY to keep it elsewhere."
+    );
     this.source = "file";
     return this.key;
+  }
+
+  /** Short fingerprint of the key, stored in envelopes to explain decryption failures. */
+  private kid(): string {
+    return crypto.createHash("sha256").update(this.masterKey()).digest("hex").slice(0, 8);
   }
 
   encrypt(value: unknown): Envelope {
     const iv = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv("aes-256-gcm", this.masterKey(), iv);
     const data = Buffer.concat([cipher.update(JSON.stringify(value), "utf8"), cipher.final()]);
-    return { v: 1, alg: "A256GCM", iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64"), data: data.toString("base64") };
+    return { v: 1, alg: "A256GCM", kid: this.kid(), iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64"), data: data.toString("base64") };
   }
 
   decrypt<T = unknown>(env: Envelope): T {
@@ -127,9 +170,12 @@ export class SecretStore {
       const plain = Buffer.concat([decipher.update(Buffer.from(env.data, "base64")), decipher.final()]);
       return JSON.parse(plain.toString("utf8")) as T;
     } catch {
+      const wrongKey = env.kid && env.kid !== this.kid();
       throw new Error(
-        "Could not decrypt stored credentials (the encryption key changed or the file was copied from another machine). " +
-          "Re-run authentication for this account."
+        (wrongKey
+          ? `Could not decrypt stored credentials: they were encrypted with a different key (${env.kid}) than the current one (${this.kid()}, from ${this.source}). `
+          : "Could not decrypt stored credentials (the encryption key changed, or the file was copied from another machine or damaged). ") +
+          "Restore the original key (OS keychain entry, master.key or GMAIL_MCP_MASTER_KEY), or reconnect this account."
       );
     }
   }

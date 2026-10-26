@@ -1,5 +1,5 @@
 import * as crypto from "node:crypto";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer, RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { calendar, calendar_v3 } from "@googleapis/calendar";
 import { z } from "zod";
 import type { AccountConfig } from "../accounts.js";
@@ -46,6 +46,9 @@ export function parseWhen(input: string | undefined, tz: string, fallback: Date)
   if (s === "now") return now;
   const dm = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (dm) return zonedTime(Number(dm[1]), Number(dm[2]), Number(dm[3]), 0, 0, tz);
+  // Local wall-clock time without an offset: interpret in `tz`, not the process time zone.
+  const lm = input.trim().match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (lm) return new Date(zonedTime(+lm[1], +lm[2], +lm[3], +lm[4], +lm[5], tz).getTime() + Number(lm[6] ?? 0) * 1000);
   const t = Date.parse(input);
   if (Number.isFinite(t)) return new Date(t);
   throw new Error(`Could not understand the date "${input}". Use today, tomorrow, YYYY-MM-DD or an ISO date-time.`);
@@ -161,9 +164,23 @@ async function fanOutCal<T>(ctx: ToolContext, accs: AccountConfig[], fn: (acc: A
 const hasCalendar = (c: ToolContext) => process.env.GMAIL_MCP_CALENDAR === "1" || c.accounts.listAccounts().some((a) => a.calendar);
 
 export function registerCalendarTools(server: McpServer, ctx: ToolContext): void {
-  register(server, ctx, {
+  // Registered always, then shown/hidden as calendar access changes (clients get tools/list_changed).
+  const tools = registerCalendarToolsInner(server, ctx);
+  const sync = () => {
+    const on = hasCalendar(ctx);
+    for (const t of tools) {
+      if (on && !t.enabled) t.enable();
+      if (!on && t.enabled) t.disable();
+    }
+  };
+  ctx.onAccountsChanged.add(sync);
+  sync();
+}
+
+function registerCalendarToolsInner(server: McpServer, ctx: ToolContext): RegisteredTool[] {
+  const tools: (RegisteredTool | undefined)[] = [];
+  tools.push(register(server, ctx, {
     name: "list_events",
-    when: hasCalendar,
     title: "Calendar: list events (all accounts)",
     description:
       "List Google Calendar events across all connected accounts with calendar access (merged, sorted by start time). " +
@@ -187,11 +204,10 @@ export function registerCalendarTools(server: McpServer, ctx: ToolContext): void
       const events = ok.flatMap((r) => r.value).sort((a, b) => (startKey(a) < startKey(b) ? -1 : 1));
       return { timeZone: tz, from: start.toISOString(), to: end.toISOString(), count: events.length, events, ...(skipped.length ? { skipped } : {}), ...(errors.length ? { errors } : {}) };
     },
-  });
+  }));
 
-  register(server, ctx, {
+  tools.push(register(server, ctx, {
     name: "list_calendars",
-    when: hasCalendar,
     title: "Calendar: list calendars",
     description: "List the Google calendars of each account with calendar access (and which ones are included in list_events).",
     minMode: "readonly",
@@ -207,11 +223,10 @@ export function registerCalendarTools(server: McpServer, ctx: ToolContext): void
       });
       return { accounts: ok.map((r) => ({ account: r.account.alias, calendars: r.value })), ...(skipped.length ? { skipped } : {}), ...(errors.length ? { errors } : {}) };
     },
-  });
+  }));
 
-  register(server, ctx, {
+  tools.push(register(server, ctx, {
     name: "find_free_time",
-    when: hasCalendar,
     title: "Calendar: find free time across accounts",
     description:
       "Find free slots when you are free in ALL connected calendars at once (busy time from every account is combined). " +
@@ -250,13 +265,14 @@ export function registerCalendarTools(server: McpServer, ctx: ToolContext): void
       const slots: { start: string; end: string; day: string }[] = [];
       const now = Date.now();
       let daysDone = 0;
+      const [y0, m0, d0] = ymdIn(tz, day0); // the local calendar day `from` falls on
       for (let i = 0; daysDone < nDays && i < nDays * 3 && slots.length < (a.maxSlots ?? 10); i++) {
-        const dayStart = new Date(day0.getTime() + i * 86_400_000 + 12 * 3_600_000);
-        const [y, m, d] = ymdIn(tz, dayStart);
-        const weekday = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+        const cal = new Date(Date.UTC(y0, m0 - 1, d0 + i));
+        const [y, m, d] = [cal.getUTCFullYear(), cal.getUTCMonth() + 1, cal.getUTCDate()];
+        const weekday = cal.getUTCDay();
         if (!a.includeWeekends && (weekday === 0 || weekday === 6)) continue;
         daysDone++;
-        let cursor = Math.max(zonedTime(y, m, d, ws[0], ws[1], tz).getTime(), now);
+        let cursor = Math.max(zonedTime(y, m, d, ws[0], ws[1], tz).getTime(), now, day0.getTime());
         const endOfDay = zonedTime(y, m, d, we[0], we[1], tz).getTime();
         for (const [bs, be] of busy) {
           if (be <= cursor || bs >= endOfDay) continue;
@@ -267,11 +283,10 @@ export function registerCalendarTools(server: McpServer, ctx: ToolContext): void
       }
       return { timeZone: tz, durationMinutes: a.durationMinutes ?? 30, accountsChecked: ok.map((r) => r.account.alias), freeSlots: slots.slice(0, a.maxSlots ?? 10), ...(skipped.length ? { skipped } : {}), ...(errors.length ? { errors } : {}) };
     },
-  });
+  }));
 
-  register(server, ctx, {
+  tools.push(register(server, ctx, {
     name: "create_event",
-    when: hasCalendar,
     title: "Calendar: create an event",
     description:
       "Create a Google Calendar event in one account (full mode only). Invitations are NOT emailed unless notifyAttendees=true. " +
@@ -336,5 +351,6 @@ export function registerCalendarTools(server: McpServer, ctx: ToolContext): void
         throw explainGoogleError(acc.alias, err);
       }
     },
-  });
+  }));
+  return tools.filter((t): t is RegisteredTool => Boolean(t));
 }

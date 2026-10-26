@@ -178,7 +178,7 @@ export async function startAuthFlow(
     }
     const granted = (tokens.scope || "").split(/\s+/).filter(Boolean);
     const hasCalendar = granted.some((s) => s.includes("/auth/calendar"));
-    accounts.addAccount(alias, email, undefined, { type: "gmail", ...(hasCalendar ? { calendar: true } : {}) });
+    accounts.addAccount(alias, email, undefined, { type: "gmail", calendar: hasCalendar });
     accounts.saveCredentials(alias, tokens);
     return { alias, email, scopes: granted };
   };

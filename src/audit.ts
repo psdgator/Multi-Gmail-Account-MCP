@@ -86,5 +86,23 @@ export class AuditLog {
   }
 }
 
-/** Tools that never change anything (filtered out by onlyChanges). Kept in sync by tests. */
-export const READ_ONLY_TOOLS = new Set<string>();
+/** Tools that never change anything (filtered out by onlyChanges). register() adds any new ones; tests keep this list in sync. */
+export const READ_ONLY_TOOLS = new Set<string>([
+  "list_accounts",
+  "view_audit_log",
+  "search_emails",
+  "inbox_summary",
+  "read_email",
+  "read_thread",
+  "read_attachment",
+  "list_labels",
+  "list_drafts",
+  "list_filters",
+  "needs_reply",
+  "daily_digest",
+  "find_newsletters",
+  "find_contact",
+  "list_events",
+  "list_calendars",
+  "find_free_time",
+]);

@@ -7,6 +7,9 @@ import { AuditLog, redact } from "../src/audit.js";
 import { GmailProvider, gmailApiFor } from "../src/providers/gmail.js";
 import { looksAutomated } from "../src/providers/types.js";
 import { SecretStore } from "../src/secrets.js";
+import { READ_ONLY_TOOLS } from "../src/audit.js";
+import { createServer } from "../src/server.js";
+import { parseWhen } from "../src/tools/calendar.js";
 import { mergeAndDedupe } from "../src/tools/common.js";
 import { startFakeGmail } from "./fake-gmail.js";
 
@@ -151,5 +154,80 @@ describe("retries", () => {
     const before = fake.requests.filter((x) => x.endsWith("/messages/send")).length;
     await expect(p.send("To: a@b.com\r\nSubject: x\r\n\r\nhi")).rejects.toBeTruthy();
     expect(fake.requests.filter((x) => x.endsWith("/messages/send")).length - before).toBe(1);
+  });
+});
+
+describe("review fixes", () => {
+  it("never creates a new key over existing encrypted logins", () => {
+    const root = tmp();
+    const file = path.join(root, "accounts", "a", "credentials.json");
+    process.env.GMAIL_MCP_MASTER_KEY = Buffer.alloc(32, 3).toString("base64");
+    try {
+      new SecretStore(root).write(file, { refresh_token: "r" });
+    } finally {
+      delete process.env.GMAIL_MCP_MASTER_KEY;
+    }
+    expect(() => new SecretStore(root).read(file)).toThrow(/Not creating a new key/);
+    expect(fs.existsSync(path.join(root, "master.key"))).toBe(false);
+  });
+
+  it("an existing key file wins and envelopes carry a key fingerprint", () => {
+    const root = tmp();
+    const s1 = new SecretStore(root);
+    const f = path.join(root, "x.json");
+    s1.write(f, { a: 1 });
+    expect(JSON.parse(fs.readFileSync(f, "utf8")).kid).toMatch(/^[0-9a-f]{8}$/);
+    expect(new SecretStore(root).read(f)).toEqual({ a: 1 });
+  });
+
+  it("parses local times in the configured time zone, not the process one", () => {
+    expect(parseWhen("2026-10-27T09:00", "Europe/Athens", new Date()).toISOString()).toBe("2026-10-27T07:00:00.000Z");
+    expect(parseWhen("2026-07-01 09:30", "Europe/Athens", new Date()).toISOString()).toBe("2026-07-01T06:30:00.000Z");
+  });
+
+  it("the static read-only list matches the tools' annotations", () => {
+    const root = tmp();
+    const { server } = createServer("full", { accounts: new AccountManager(root) });
+    const tools = (server as unknown as { _registeredTools: Record<string, { annotations?: { readOnlyHint?: boolean } }> })._registeredTools;
+    for (const [name, t] of Object.entries(tools)) expect(READ_ONLY_TOOLS.has(name)).toBe(Boolean(t.annotations?.readOnlyHint));
+  });
+
+  it("calendar tools appear when an account gains calendar access", () => {
+    const root = tmp();
+    const m = new AccountManager(root);
+    m.addAccount("a", "a@x.com");
+    const { server, ctx } = createServer("drafts", { accounts: m });
+    const tools = (server as unknown as { _registeredTools: Record<string, { enabled: boolean }> })._registeredTools;
+    expect(tools.list_events.enabled).toBe(false);
+    m.updateAccount("a", { calendar: true });
+    for (const cb of ctx.onAccountsChanged) cb();
+    expect(tools.list_events.enabled).toBe(true);
+    expect(tools.find_free_time.enabled).toBe(true);
+  });
+});
+
+describe("gmail pagination", () => {
+  let fake2: Awaited<ReturnType<typeof startFakeGmail>>;
+  beforeAll(async () => {
+    fake2 = await startFakeGmail();
+    process.env.GMAIL_MCP_API_ROOT = fake2.url;
+    const box = fake2.boxes["tok-psd"];
+    for (let i = 0; i < 620; i++) box.messages.push({ id: `bulk${i}`, threadId: `tb${i}`, internalDate: String(Date.now() - i * 1000), labelIds: ["INBOX"], snippet: "", payload: { headers: [{ name: "From", value: "bulk@x.example" }] } });
+  });
+  afterAll(async () => {
+    delete process.env.GMAIL_MCP_API_ROOT;
+    await fake2.close();
+  });
+
+  it("pages through more than 500 ids", async () => {
+    const root = tmp();
+    fs.writeFileSync(path.join(root, "oauth-keys.json"), JSON.stringify({ installed: { client_id: "c", client_secret: "s" } }));
+    const m = new AccountManager(root);
+    const acc = m.addAccount("psd", "antony@psdgator.com");
+    m.saveCredentials("psd", { access_token: "tok-psd", refresh_token: "r", expiry_date: Date.now() + 3600_000 });
+    const p = new GmailProvider(acc, gmailApiFor(m, acc));
+    const r = await p.search({ query: "from:bulk@x.example", max: 600, idsOnly: true });
+    expect(r.messages).toHaveLength(600);
+    expect(new Set(r.messages.map((x) => x.id)).size).toBe(600);
   });
 });

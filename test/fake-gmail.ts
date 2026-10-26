@@ -39,6 +39,10 @@ export function fixtures(): Record<string, Mailbox> {
       labels: [
         { id: "INBOX", name: "INBOX", type: "system" },
         { id: "UNREAD", name: "UNREAD", type: "system" },
+        { id: "TRASH", name: "TRASH", type: "system" },
+        { id: "SPAM", name: "SPAM", type: "system" },
+        { id: "SENT", name: "SENT", type: "system" },
+        { id: "DRAFT", name: "DRAFT", type: "system" },
         { id: "Label_1", name: "Πελάτες", type: "user" },
       ],
       sendAs: [{ sendAsEmail: "urbanstickersgr@gmail.com", displayName: "UrbanStickers", isDefault: true, signature: "<b>UrbanStickers</b><br>urbanstickers.gr" }],
@@ -287,12 +291,15 @@ export async function startFakeGmail(): Promise<FakeGmail> {
     if (p === "/messages" && req.method === "GET") {
       const q = url.searchParams.get("q") ?? "";
       const max = Number(url.searchParams.get("maxResults") ?? 100);
-      const found = box.messages
+      if (max > 500) return send(400, { error: { code: 400, message: "maxResults must be <= 500" } });
+      const all = box.messages
         .filter((m) => matches(m, q))
         .filter((m) => url.searchParams.get("includeSpamTrash") === "true" || !m.labelIds.includes("TRASH"))
-        .sort((a, b) => Number(b.internalDate) - Number(a.internalDate))
-        .slice(0, max);
-      return send(200, { messages: found.map((m) => ({ id: m.id, threadId: m.threadId })), resultSizeEstimate: found.length });
+        .sort((a, b) => Number(b.internalDate) - Number(a.internalDate));
+      const offset = Number(url.searchParams.get("pageToken") ?? 0);
+      const found = all.slice(offset, offset + max);
+      const next = offset + max < all.length ? String(offset + max) : undefined;
+      return send(200, { messages: found.map((m) => ({ id: m.id, threadId: m.threadId })), resultSizeEstimate: all.length, ...(next ? { nextPageToken: next } : {}) });
     }
     if (p === "/messages/send" && req.method === "POST") {
       const b = JSON.parse(bodyText);

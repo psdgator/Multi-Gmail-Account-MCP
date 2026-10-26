@@ -36,6 +36,12 @@ export const RETRY_CONFIG = {
 
 const META_HEADERS = ["From", "To", "Cc", "Subject", "Date", "Reply-To", "Message-ID"];
 
+/**
+ * System labels that must never be set/removed through label tools: applying TRASH or
+ * SPAM would delete mail outside full mode; DRAFT/SENT/CHAT are managed by Gmail.
+ */
+const FORBIDDEN_LABELS = new Set(["TRASH", "SPAM", "DRAFT", "SENT", "CHAT"]);
+
 /** Friendlier errors for the things that actually go wrong with Gmail OAuth. */
 export function explainGoogleError(alias: string, err: unknown): Error {
   const e = err as {
@@ -63,7 +69,7 @@ export function explainGoogleError(alias: string, err: unknown): Error {
   if (status === 403 && /has not been used|is disabled|accessNotConfigured/i.test(msg)) {
     return new Error(`[${alias}] The Google API for this action is not enabled in your Google Cloud project: ${detail ?? e?.message}`);
   }
-  if (status === 404) {
+  if (status === 404 || (status === 400 && /invalid id|invalid.*value|malformed/i.test(msg))) {
     return new Error(`Not found in "${alias}" (wrong id, or it belongs to a different account).`);
   }
   if (status === 429) {
@@ -177,27 +183,30 @@ export class GmailProvider implements MailProvider {
   }
 
   async search(o: SearchOptions): Promise<SearchResult> {
-    const res = await this.api.users.messages.list({
-      userId: "me",
-      q: o.query,
-      maxResults: o.max,
-      includeSpamTrash: o.includeSpamTrash ?? false,
-      ...(o.pageToken ? { pageToken: o.pageToken } : {}),
-    });
-    const ids = (res.data.messages ?? []).map((m) => m.id!).filter(Boolean);
+    // messages.list returns at most 500 per page: page through for larger requests.
+    const found: { id: string; threadId: string }[] = [];
+    let pageToken = o.pageToken;
+    let estimate = 0;
+    do {
+      const res = await this.api.users.messages.list({
+        userId: "me",
+        q: o.query,
+        maxResults: Math.min(500, o.max - found.length),
+        includeSpamTrash: o.includeSpamTrash ?? false,
+        ...(pageToken ? { pageToken } : {}),
+      });
+      for (const m of res.data.messages ?? []) if (m.id) found.push({ id: m.id, threadId: m.threadId ?? "" });
+      estimate = Math.max(estimate, res.data.resultSizeEstimate ?? 0);
+      pageToken = res.data.nextPageToken ?? undefined;
+    } while (pageToken && found.length < o.max);
     if (o.idsOnly) {
-      const threadOf = new Map((res.data.messages ?? []).map((m) => [m.id!, m.threadId ?? ""]));
       return {
-        messages: ids.map((id) => ({ account: this.account.alias, id, threadId: threadOf.get(id) ?? "", date: "", from: "", to: "", subject: "", labels: [], unread: false, starred: false })),
-        next: res.data.nextPageToken ?? undefined,
-        estimate: res.data.resultSizeEstimate ?? 0,
+        messages: found.map(({ id, threadId }) => ({ account: this.account.alias, id, threadId, date: "", from: "", to: "", subject: "", labels: [], unread: false, starred: false })),
+        next: pageToken,
+        estimate,
       };
     }
-    return {
-      messages: await this.meta(ids, o.headers),
-      next: res.data.nextPageToken ?? undefined,
-      estimate: res.data.resultSizeEstimate ?? 0,
-    };
+    return { messages: await this.meta(found.map((m) => m.id), o.headers), next: pageToken, estimate };
   }
 
   async inboxStatus(): Promise<InboxStatus> {
@@ -286,8 +295,13 @@ export class GmailProvider implements MailProvider {
     if (!names?.length) return [];
     const { byName } = await this.labels();
     return names.map((n) => {
-      const id = byName.get(n.trim().toLowerCase());
+      const id = FORBIDDEN_LABELS.has(n.trim().toUpperCase()) ? n.trim().toUpperCase() : byName.get(n.trim().toLowerCase());
       if (!id) throw new Error(`Label "${n}" does not exist in ${this.account.alias}. Use list_labels, or create_label first.`);
+      if (FORBIDDEN_LABELS.has(id)) {
+        throw new Error(
+          `"${n}" can't be added or removed as a label. ${id === "TRASH" ? "Moving mail to Trash is only possible with trash_emails / bulk_cleanup in full mode." : "Gmail manages this label itself."}`
+        );
+      }
       return id;
     });
   }
