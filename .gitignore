@@ -29,3 +29,6 @@ coverage/
 # Environment
 .env
 .env.local
+
+# Google OAuth client downloads
+client_secret*.json
