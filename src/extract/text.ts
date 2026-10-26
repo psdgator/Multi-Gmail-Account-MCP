@@ -1,5 +1,25 @@
 /** Charset-aware decoding for text attachments (UTF-8/16, Greek windows-1253 / ISO-8859-7, Latin). */
 
+/**
+ * Trim trailing spaces/tabs on every line, collapse 3+ blank lines, trim the ends.
+ * Linear time (no backtracking regex like /[ \t]+\n/, which is quadratic on long
+ * runs of spaces in hostile files).
+ */
+export function tidyText(s: string): string {
+  const lines = s.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    let end = l.length;
+    while (end > 0) {
+      const c = l.charCodeAt(end - 1);
+      if (c !== 32 && c !== 9) break;
+      end--;
+    }
+    if (end !== l.length) lines[i] = l.slice(0, end);
+  }
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 function tryDecode(buf: Uint8Array, charset: string, fatal = false): string | undefined {
   try {
     return new TextDecoder(charset, { fatal }).decode(buf);
@@ -16,7 +36,8 @@ const isLatinLetter = (ch: string | undefined) => ch !== undefined && /[A-Za-z]/
  * letters, and Greek letters not glued to Latin ones (Latin-1 text decoded as
  * 1253 gives words like "Cafι").
  */
-function plausibleGreek(s: string): boolean {
+function plausibleGreek(text: string): boolean {
+  const s = text.length > 200_000 ? text.slice(0, 200_000) : text; // a sample is enough
   const chars = [...s];
   let greek = 0;
   let other = 0;

@@ -1,3 +1,5 @@
+import { tidyText } from "./text.js";
+
 /**
  * Small RTF-to-text converter: paragraphs, tabs, \uN unicode escapes and \'hh
  * bytes in the document code page (\ansicpg1253 for Greek). Skips destinations
@@ -105,5 +107,5 @@ export function rtfToText(rtf: string): string {
     if (!skip) out += ch;
   }
   flushBytes();
-  return out.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return tidyText(out);
 }

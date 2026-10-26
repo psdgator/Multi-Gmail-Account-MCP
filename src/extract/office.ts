@@ -1,3 +1,4 @@
+import { tidyText } from "./text.js";
 import { attr, local, xmlTokens } from "./xml.js";
 import { utf8 } from "./zip.js";
 
@@ -5,11 +6,7 @@ import { utf8 } from "./zip.js";
 
 type Files = Record<string, Uint8Array>;
 
-const tidy = (s: string) =>
-  s
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+const tidy = tidyText;
 
 /** Resolve a relationship target relative to the folder of the part that owns it. */
 function resolveTarget(baseDir: string, target: string): string {
@@ -69,7 +66,14 @@ export function wordXmlToText(xml: string): string {
       else if (n === "w:p") flushPara();
       else if (n === "w:tc" && tables.length) {
         const t = tables[tables.length - 1];
-        t.cells.push(t.cell.trim().replace(/\s*\n\s*/g, " / "));
+        // Lines of a cell joined with " / " (split/trim instead of /\s*\n\s*/, which backtracks).
+        t.cells.push(
+          t.cell
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean)
+            .join(" / ")
+        );
         t.cell = "";
       } else if (n === "w:tr" && tables.length) {
         const t = tables[tables.length - 1];
@@ -360,10 +364,13 @@ export function odtText(files: Files): string {
   return tidy(out.join("\n"));
 }
 
+/** Caps for OpenDocument spreadsheets, whose repeat attributes can expand a few bytes into millions of cells. */
+export const ODS_LIMITS = { maxColumns: 500, maxRepeat: 200, maxChars: 5_000_000 };
+
 export function odsText(files: Files, opts: SheetOptions = {}): { text: string; sheets: string[]; notes: string[] } {
   const maxRows = opts.maxRowsPerSheet ?? 1000;
   const blocks: { name: string; rows: string[] }[] = [];
-  const notes: string[] = [];
+  const notes = new Set<string>();
   let cur: { name: string; rows: string[] } | undefined;
   let row: string[] = [];
   let cell = "";
@@ -371,9 +378,14 @@ export function odsText(files: Files, opts: SheetOptions = {}): { text: string; 
   let repeatCols = 1;
   let repeatRows = 1;
   let cellValue: string | undefined;
+  let budget = ODS_LIMITS.maxChars;
+  const pushCells = (v: string, times: number) => {
+    const n = Math.min(Math.max(1, times || 1), ODS_LIMITS.maxRepeat, ODS_LIMITS.maxColumns - row.length);
+    for (let i = 0; i < n; i++) row.push(v);
+  };
   for (const t of xmlTokens(utf8(files["content.xml"]))) {
     if (t.type === "text") {
-      if (inCell) cell += t.text;
+      if (inCell && cell.length < 32_000) cell += t.text;
       continue;
     }
     const n = t.name;
@@ -382,25 +394,31 @@ export function odsText(files: Files, opts: SheetOptions = {}): { text: string; 
       blocks.push(cur);
     } else if (t.type === "open" && n === "table:table-row") {
       row = [];
-      repeatRows = Math.min(Number(attr(t.attrs, "table:number-rows-repeated") ?? 1), 1000);
+      repeatRows = Math.min(Number(attr(t.attrs, "table:number-rows-repeated") ?? 1) || 1, 1000);
     } else if ((t.type === "open" || t.type === "self") && (n === "table:table-cell" || n === "table:covered-table-cell")) {
-      repeatCols = Number(attr(t.attrs, "table:number-columns-repeated") ?? 1);
+      repeatCols = Number(attr(t.attrs, "table:number-columns-repeated") ?? 1) || 1;
       cellValue = attr(t.attrs, "office:date-value") ?? attr(t.attrs, "office:value") ?? attr(t.attrs, "office:boolean-value");
       cell = "";
       inCell = t.type === "open";
-      if (t.type === "self") for (let i = 0; i < Math.min(repeatCols, 200); i++) row.push("");
+      if (t.type === "self") pushCells(cellValue ?? "", repeatCols);
     } else if (t.type === "close" && (n === "table:table-cell" || n === "table:covered-table-cell")) {
       inCell = false;
-      const v = cell || cellValue || "";
-      for (let i = 0; i < Math.min(repeatCols, v ? 200 : 200); i++) row.push(v);
+      pushCells(cell || cellValue || "", repeatCols);
     } else if (t.type === "self" && n === "text:s" && inCell) cell += " ";
     else if (t.type === "close" && n === "text:p" && inCell) cell += "\n";
     else if (t.type === "close" && n === "table:table-row" && cur) {
       while (row.length && row[row.length - 1] === "") row.pop();
       if (row.length) {
+        if (budget <= 0) {
+          notes.add(`Spreadsheet is too large to show completely; output stopped after ${ODS_LIMITS.maxChars.toLocaleString("en")} characters.`);
+          continue;
+        }
         const line = row.map((v) => csvCell(v.trim())).join(",");
-        for (let i = 0; i < repeatRows && cur.rows.length < maxRows; i++) cur.rows.push(line);
-        if (cur.rows.length >= maxRows) notes.push(`Sheet "${cur.name}" truncated to ${maxRows} rows.`);
+        for (let i = 0; i < repeatRows && cur.rows.length < maxRows && budget > 0; i++) {
+          cur.rows.push(line);
+          budget -= line.length + 1;
+        }
+        if (cur.rows.length >= maxRows) notes.add(`Sheet "${cur.name}" truncated to ${maxRows} rows.`);
       }
     }
   }
@@ -408,6 +426,6 @@ export function odsText(files: Files, opts: SheetOptions = {}): { text: string; 
   return {
     text: wanted.map((b) => `=== Sheet: ${b.name} ===\n${b.rows.join("\n") || "(empty)"}`).join("\n\n"),
     sheets: blocks.map((b) => b.name),
-    notes: [...new Set(notes)],
+    notes: [...notes],
   };
 }

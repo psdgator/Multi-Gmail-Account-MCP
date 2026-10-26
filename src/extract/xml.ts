@@ -19,22 +19,99 @@ export function decodeXmlEntities(s: string): string {
   });
 }
 
-const TOKEN_RE = /<!\[CDATA\[([\s\S]*?)\]\]>|<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!DOCTYPE[^>]*>|<(\/?)([A-Za-z_][\w:.-]*)((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>|([^<]+)/g;
+const LT = 60; // <
+const GT = 62; // >
+const SLASH = 47; // /
+const DQ = 34; // "
+const SQ = 39; // '
 
+const isNameStart = (c: number) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95; // A-Z a-z _
+const isNameChar = (c: number) => isNameStart(c) || (c >= 48 && c <= 57) || c === 58 || c === 46 || c === 45; // 0-9 : . -
+
+/**
+ * Linear-time tokenizer: every character is looked at a bounded number of times,
+ * so malformed or hostile input (thousands of unclosed tags, unterminated quotes
+ * or comments) cannot make it slow. Real Office XML never has a raw "<" inside a
+ * tag, so a "<" before the closing ">" marks the tag as malformed; its text is then
+ * emitted as plain text (the "<" itself is dropped), as before.
+ */
 export function* xmlTokens(xml: string): Generator<XmlToken> {
-  TOKEN_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = TOKEN_RE.exec(xml))) {
-    if (m[1] !== undefined) {
-      yield { type: "text", text: m[1] };
-    } else if (m[3] !== undefined) {
-      const name = m[3];
-      if (m[2] === "/") yield { type: "close", name };
-      else if (m[5] === "/") yield { type: "self", name, attrs: m[4] ?? "" };
-      else yield { type: "open", name, attrs: m[4] ?? "" };
-    } else if (m[6] !== undefined) {
-      yield { type: "text", text: decodeXmlEntities(m[6]) };
+  const n = xml.length;
+  let i = 0;
+  while (i < n) {
+    const lt = xml.indexOf("<", i);
+    if (lt === -1) {
+      yield { type: "text", text: decodeXmlEntities(xml.slice(i)) };
+      return;
     }
+    if (lt > i) yield { type: "text", text: decodeXmlEntities(xml.slice(i, lt)) };
+
+    if (xml.startsWith("<![CDATA[", lt)) {
+      const end = xml.indexOf("]]>", lt + 9);
+      if (end === -1) {
+        yield { type: "text", text: xml.slice(lt + 9) };
+        return;
+      }
+      yield { type: "text", text: xml.slice(lt + 9, end) };
+      i = end + 3;
+      continue;
+    }
+    if (xml.startsWith("<!--", lt)) {
+      const end = xml.indexOf("-->", lt + 4);
+      if (end === -1) return; // unterminated comment: the rest is comment
+      i = end + 3;
+      continue;
+    }
+    if (xml.startsWith("<?", lt)) {
+      const end = xml.indexOf("?>", lt + 2);
+      if (end === -1) return;
+      i = end + 2;
+      continue;
+    }
+    if (xml.charCodeAt(lt + 1) === 33 /* ! */) {
+      // DOCTYPE and other declarations
+      const end = xml.indexOf(">", lt + 2);
+      if (end === -1) return;
+      i = end + 1;
+      continue;
+    }
+
+    // Element tag: <name ...>, </name>, <name .../>
+    let k = lt + 1;
+    const closing = xml.charCodeAt(k) === SLASH;
+    if (closing) k++;
+    if (!isNameStart(xml.charCodeAt(k))) {
+      i = lt + 1; // not a tag; drop the "<", keep scanning as text
+      continue;
+    }
+    const nameStart = k;
+    while (k < n && isNameChar(xml.charCodeAt(k))) k++;
+    const name = xml.slice(nameStart, k);
+    const bodyStart = k;
+    let quote = 0;
+    let gt = -1;
+    for (; k < n; k++) {
+      const c = xml.charCodeAt(k);
+      if (c === LT) break; // malformed: "<" inside a tag (also inside a quoted value)
+      if (quote) {
+        if (c === quote) quote = 0;
+      } else if (c === DQ || c === SQ) quote = c;
+      else if (c === GT) {
+        gt = k;
+        break;
+      }
+    }
+    if (gt === -1) {
+      i = lt + 1; // malformed/unterminated tag: treat as text from after the "<"
+      continue;
+    }
+    if (closing) yield { type: "close", name };
+    else {
+      const body = xml.slice(bodyStart, gt);
+      if (body.endsWith("/")) yield { type: "self", name, attrs: body.slice(0, -1) };
+      else yield { type: "open", name, attrs: body };
+    }
+    i = gt + 1;
   }
 }
 
