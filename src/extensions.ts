@@ -4,3 +4,4 @@
  * Keep one line per module so features can be added independently.
  */
 export {};
+import "./cli/http.js";
