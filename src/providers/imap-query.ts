@@ -7,38 +7,67 @@ import type { SearchObject } from "imapflow";
  * Applied faithfully:
  *   from: to: cc: bcc: subject: (incl. "quoted phrases"), free words and "phrases" (IMAP TEXT),
  *   is:unread / is:read / is:starred / is:unstarred / is:draft / is:answered,
- *   after: before: (YYYY/MM/DD, YYYY-MM-DD or a Unix timestamp), larger: smaller: (k/m),
- *   rfc822msgid:, negation with a leading "-", "a OR b", grouping with ( ) and { } (OR-group),
- *   and, at the top level only (not negated, not inside a group):
- *   in:inbox|sent|drafts|trash|spam|archive|anywhere, label:<folder> / in:<folder>,
- *   has:attachment, newer_than: / older_than: (h/d/w/m/y; exact to the second, checked after
- *   the server search because IMAP SINCE/BEFORE only know whole days).
+ *   after: before: (YYYY/MM/DD or YYYY-MM-DD = whole days on the server; a Unix timestamp =
+ *   exact to the second), larger: smaller: (k/m), rfc822msgid:, newer_than: / older_than:
+ *   (h/d/w/m/y, exact to the second), negation with a leading "-", "a OR b", grouping with
+ *   ( ) and { } (OR-group), and, at the top level only (not negated, not inside a group):
+ *   in:inbox|sent|drafts|trash|spam|archive|anywhere, label:<folder> / in:<folder>, has:attachment.
+ *
+ * Exactness: IMAP FROM/TO/CC/BCC match substrings, and SINCE/BEFORE only know whole days (in
+ * the server's time zone). So a full address (from:bob@x.com) must be exactly one of that
+ * field's addresses (not "notbob@x.com"), and timestamps / newer_than: / older_than: are
+ * compared with the internal date to the second. The server search is made a little broader
+ * where needed and the provider narrows it afterwards: top-level parts through `addrs`,
+ * `notBefore` and `notAfter`; parts inside OR / NOT groups through `exact` (evaluated as UID
+ * sets). A partial value (from:bob, from:@x.com) keeps IMAP's substring meaning.
  *
  * Everything else is NOT applied and is listed in `ignored` (the provider returns it as
  * SearchResult.ignored): Gmail-only operators (category:, is:important, list:, filename:,
  * deliveredto:, has:drive ...), unknown operators, negated or grouped location operators
- * (-in:sent, (label:x OR ...)), has:attachment / newer_than: inside a group, invalid dates
- * or sizes, and unbalanced parentheses. When `ignored` is non-empty the results can be
- * broader (or narrower) than the query asked for; bulk actions must refuse such queries.
+ * (-in:sent, (label:x OR ...)), has:attachment inside a group, invalid dates, periods or
+ * sizes, unbalanced parentheses, and a non-empty query with no usable term at all ("OR",
+ * "-", '""'). When `ignored` is non-empty the results can be broader (or narrower) than the
+ * query asked for; bulk actions must refuse such queries. The empty query means all mail.
  */
 
 export type FolderRole = "inbox" | "sent" | "drafts" | "trash" | "junk" | "archive" | "all";
+export type AddrField = "from" | "to" | "cc" | "bcc";
+
+/** A part the server can only approximate; the provider checks it exactly. */
+export type ExactLeaf =
+  /** The field holds exactly this address (lower case), compared with the parsed envelope. */
+  | { kind: "addr"; field: AddrField; addr: string }
+  /** INTERNALDATE >= at (since) or < at (!since). */
+  | { kind: "time"; since: boolean; at: Date };
+
+/** The query as a tree; "crit" leaves are exact on the server. */
+export type QNode =
+  | { t: "crit"; crit: Crit }
+  | { t: "exact"; leaf: ExactLeaf }
+  | { t: "and"; items: QNode[] }
+  | { t: "or"; items: QNode[] }
+  | { t: "not"; item: QNode };
 
 export interface ImapQuery {
   /** Where to look: special folders by role, named folders, or every folder. */
   roles: FolderRole[];
   folders: string[];
   anywhere: boolean;
+  /** Server search. Exact, or broader where `addrs` / `notBefore` / `notAfter` / `exact` narrow it. */
   criteria: SearchObject;
-  /** Exact lower bound on the internal date (top-level newer_than:). */
+  /** Top-level full addresses, checked on the fetched envelopes (neg: must NOT be there). */
+  addrs: { field: AddrField; addr: string; neg: boolean }[];
+  /** Exact lower bound on the internal date (top-level newer_than:, after:<timestamp>). */
   notBefore?: Date;
-  /** Exact upper bound on the internal date (top-level older_than:). */
+  /** Exact upper bound (exclusive) on the internal date (top-level older_than:, before:<timestamp>). */
   notAfter?: Date;
+  /** Top-level groups that contain exact parts under OR / NOT; each must hold as well. */
+  exact: QNode[];
   hasAttachment?: boolean;
   ignored: string[];
 }
 
-type Crit = [key: string, value: unknown];
+export type Crit = [key: string, value: unknown];
 
 export interface Token {
   neg: boolean;
@@ -83,7 +112,7 @@ export function tokenize(q: string): Token[] {
       j++;
     }
     let op: string | undefined;
-    const opm = /^([a-zA-Z_]+):/.exec(s.slice(j));
+    const opm = /^([a-zA-Z_][a-zA-Z0-9_]*):/.exec(s.slice(j)); // digits too: rfc822msgid:
     if (opm) {
       op = opm[1].toLowerCase();
       j += opm[0].length;
@@ -151,6 +180,48 @@ function size(v: string): number | undefined {
 }
 
 const startOfUtcDay = (d: Date) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+
+/**
+ * Midnight (UTC) `days` days after the UTC day of `d`. IMAP SINCE/BEFORE compare whole days in
+ * the server's (or the message's) time zone, up to 14 hours away from UTC, so day bounds one
+ * day wider than the UTC day are always broader than an exact instant bound, and day bounds
+ * two days further are always inside it. Always midnight: imapflow moves a non-midnight
+ * BEFORE to the next day.
+ */
+export const dayPlus = (d: Date, days: number) => new Date(startOfUtcDay(d).getTime() + days * 86_400_000);
+
+/** A complete address (local@domain.tld): matched exactly. Anything else is a substring. */
+const FULL_ADDR = /^[^\s@<>()",;:]+@[^\s@<>()",;:.]+(?:\.[^\s@<>()",;:.]+)+$/;
+const TIMESTAMP = /^\d{9,11}$/;
+
+const isAddrOp = (op: string | undefined): op is AddrField => op === "from" || op === "to" || op === "cc" || op === "bcc";
+
+/** A full address term (from:bob@x.com), or undefined. */
+function fullAddr(t: Token): { field: AddrField; addr: string } | undefined {
+  return isAddrOp(t.op) && FULL_ADDR.test(t.value) ? { field: t.op, addr: t.value.toLowerCase() } : undefined;
+}
+
+/**
+ * An exact time bound: newer_than: / older_than: (relative) or after: / before: with a Unix
+ * timestamp. Negation flips the direction ("-older_than:3d" = newer than 3 days). Plain
+ * dates (YYYY/MM/DD) are left to the server as whole days.
+ */
+function timeBound(t: Token, now: Date): { since: boolean; at: Date } | undefined {
+  switch (t.op) {
+    case "newer_than":
+    case "newer":
+    case "older_than":
+    case "older": {
+      const at = relative(t.value, now);
+      return at ? { since: (t.op === "newer_than" || t.op === "newer") !== t.neg, at } : undefined;
+    }
+    case "after":
+    case "since":
+    case "before":
+      return TIMESTAMP.test(t.value) ? { since: (t.op !== "before") !== t.neg, at: new Date(Number(t.value) * 1000) } : undefined;
+  }
+  return undefined;
+}
 
 const ROLE_WORDS: Record<string, FolderRole> = {
   inbox: "inbox",
@@ -302,15 +373,10 @@ function termCrit(t: Token, now: Date, ignored: string[], nested: boolean): Crit
       return d ? ["before", d] : skip(" (invalid date)");
     }
     case "older_than":
-    case "older": {
-      // Inside a group: whole days (IMAP BEFORE), i.e. never broader than asked.
-      const d = relative(v, now);
-      return d ? ["before", startOfUtcDay(d)] : skip(" (invalid period)");
-    }
+    case "older":
     case "newer_than":
     case "newer":
-      // Only exact at the top level (handled by the caller); IMAP SINCE would round to whole days.
-      return relative(v, now) ? skip(nested ? " (inside a group: not supported for IMAP)" : "") : skip(" (invalid period)");
+      return skip(" (invalid period)"); // valid ones are exact time bounds (timeBound)
     case "larger": {
       const n = size(v);
       return n !== undefined ? ["larger", n] : skip(" (invalid size)");
@@ -333,41 +399,84 @@ function termCrit(t: Token, now: Date, ignored: string[], nested: boolean): Crit
   return skip();
 }
 
-/** One node as a list of AND-ed criteria (empty = nothing applicable). */
-function nodeCrits(n: Node, now: Date, ignored: string[]): Crit[] {
+/** A syntax node as a query tree (undefined = nothing applicable; the reason is in `ignored`). */
+function toQNode(n: Node, now: Date, ignored: string[]): QNode | undefined {
   switch (n.type) {
     case "term": {
-      const c = termCrit(n.tok, now, ignored, true);
-      if (!c) return [];
-      return [n.tok.neg ? ["not", { [c[0]]: c[1] }] : c];
+      const t = n.tok;
+      const tb = timeBound(t, now);
+      if (tb) return { t: "exact", leaf: { kind: "time", ...tb } };
+      const fa = fullAddr(t);
+      const c = fa ? undefined : termCrit(t, now, ignored, true);
+      if (!fa && !c) return undefined;
+      const leaf: QNode = fa ? { t: "exact", leaf: { kind: "addr", ...fa } } : { t: "crit", crit: c! };
+      return t.neg ? { t: "not", item: leaf } : leaf;
     }
     case "and":
-      return n.items.flatMap((x) => nodeCrits(x, now, ignored));
     case "or": {
-      const alts: SearchObject[] = [];
-      for (const x of n.items) {
-        const cs = nodeCrits(x, now, ignored);
-        if (cs.length) alts.push(buildCriteria(cs));
-      }
-      if (!alts.length) return [];
-      return alts.length === 1 ? Object.entries(alts[0]) as Crit[] : [["or", alts]];
+      const items = n.items.map((x) => toQNode(x, now, ignored)).filter((x): x is QNode => Boolean(x));
+      if (!items.length) return undefined;
+      return items.length === 1 ? items[0] : { t: n.type, items };
     }
     case "not": {
-      const cs = nodeCrits(n.item, now, ignored);
-      return cs.length ? [["not", buildCriteria(cs)]] : [];
+      const item = toQNode(n.item, now, ignored);
+      return item ? { t: "not", item } : undefined;
     }
   }
 }
 
+/** Does the tree need the provider's exact checks (addresses, time bounds)? */
+export function hasExact(n: QNode): boolean {
+  switch (n.t) {
+    case "crit":
+      return false;
+    case "exact":
+      return true;
+    case "and":
+    case "or":
+      return n.items.some(hasExact);
+    case "not":
+      return hasExact(n.item);
+  }
+}
+
+/** A tree without exact leaves as a list of AND-ed server criteria. */
+function toCrits(n: QNode): Crit[] {
+  switch (n.t) {
+    case "crit":
+      return [n.crit];
+    case "exact":
+      throw new Error("internal: an exact check has no IMAP search criterion");
+    case "and":
+      return n.items.flatMap(toCrits);
+    case "or": {
+      const alts = n.items.map((x) => buildCriteria(toCrits(x)));
+      return alts.length === 1 ? (Object.entries(alts[0]) as Crit[]) : [["or", alts]];
+    }
+    case "not":
+      return [["not", buildCriteria(toCrits(n.item))]];
+  }
+}
+
+/** Server criteria for a tree that is exact on the server, else undefined. */
+export function compileNode(n: QNode): SearchObject | undefined {
+  return hasExact(n) ? undefined : buildCriteria(toCrits(n));
+}
+
 export function parseGmailQuery(query: string, now = new Date()): ImapQuery {
-  const q: ImapQuery = { roles: [], folders: [], anywhere: false, criteria: {}, ignored: [] };
+  const q: ImapQuery = { roles: [], folders: [], anywhere: false, criteria: {}, addrs: [], exact: [], ignored: [] };
   const tree = new Parser(tokenize(query ?? ""), q.ignored).seq();
   const top = tree.type === "and" ? tree.items : [tree];
   const crits: Crit[] = [];
 
-  for (const n of top) {
+  for (let n of top) {
+    // "-(x)" around a single term is just "-x".
+    if (n.type === "not" && n.item.type === "term") n = { type: "term", tok: { ...n.item.tok, neg: !n.item.tok.neg } };
     if (n.type !== "term") {
-      crits.push(...nodeCrits(n, now, q.ignored));
+      const qn = toQNode(n, now, q.ignored);
+      if (!qn) continue;
+      if (hasExact(qn)) q.exact.push(qn);
+      else crits.push(...toCrits(qn));
       continue;
     }
     const t = n.tok;
@@ -384,17 +493,24 @@ export function parseGmailQuery(query: string, now = new Date()): ImapQuery {
       q.hasAttachment = !t.neg;
       continue;
     }
-    if ((t.op === "newer_than" || t.op === "newer" || t.op === "older_than" || t.op === "older") && relative(t.value, now)) {
-      const d = relative(t.value, now)!;
-      // "newer" and "-older" mean the same thing, and vice versa.
-      const isNewer = (t.op === "newer_than" || t.op === "newer") !== t.neg;
-      if (isNewer) {
-        q.notBefore = !q.notBefore || d > q.notBefore ? d : q.notBefore;
-        crits.push(["since", startOfUtcDay(d)]); // whole days on the server, exact after
+    const tb = timeBound(t, now);
+    if (tb) {
+      // A day wider on the server, exact to the second afterwards.
+      if (tb.since) {
+        q.notBefore = !q.notBefore || tb.at > q.notBefore ? tb.at : q.notBefore;
+        crits.push(["since", dayPlus(tb.at, -1)]);
       } else {
-        q.notAfter = !q.notAfter || d < q.notAfter ? d : q.notAfter;
-        crits.push(["before", new Date(startOfUtcDay(d).getTime() + 86_400_000)]);
+        q.notAfter = !q.notAfter || tb.at < q.notAfter ? tb.at : q.notAfter;
+        crits.push(["before", dayPlus(tb.at, 2)]);
       }
+      continue;
+    }
+    const fa = fullAddr(t);
+    if (fa) {
+      // Substring on the server (never narrower), exact on the envelope afterwards. A negated
+      // address is not sent: IMAP's NOT FROM would also drop "notbob@x.com".
+      q.addrs.push({ ...fa, neg: t.neg });
+      if (!t.neg) crits.push([fa.field, t.value]);
       continue;
     }
     const c = termCrit(t, now, q.ignored, false);
@@ -402,6 +518,10 @@ export function parseGmailQuery(query: string, now = new Date()): ImapQuery {
     crits.push(t.neg ? ["not", { [c[0]]: c[1] }] : c);
   }
 
+  const usable =
+    crits.length || q.exact.length || q.addrs.length || q.roles.length || q.folders.length || q.anywhere || q.hasAttachment !== undefined || q.notBefore || q.notAfter;
+  // Only the empty query means "all mail"; "OR", "-", '""' or blanks must not silently become it.
+  if (!usable && (query ?? "") !== "" && !q.ignored.length) q.ignored.push("no usable search terms");
   q.criteria = crits.length ? buildCriteria(crits) : { all: true };
   return q;
 }
