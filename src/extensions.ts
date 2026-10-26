@@ -4,3 +4,5 @@
  * Keep one line per module so features can be added independently.
  */
 import "./tools/attachments.js";
+import "./providers/imap.js";
+import "./cli/imap.js";
