@@ -1,0 +1,13 @@
+# TLS front for gmail-mcp-multi hosted mode. Caddy gets a Let's Encrypt
+# certificate for $MCP_DOMAIN automatically (ports 80/443 must be reachable).
+{$MCP_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy app:8787 {
+		# Stream MCP responses (Server-Sent Events) without buffering.
+		flush_interval -1
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+}

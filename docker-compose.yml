@@ -1,0 +1,44 @@
+# Hosted mode: app + Caddy (automatic HTTPS). Usage: see docs/hosted.md
+#   cp deploy/env.example .env   # fill in the values
+#   mkdir -p secrets && cp ~/Downloads/client_secret_*.json secrets/oauth-keys.json
+#   docker compose up -d --build
+#   docker compose run --rm app auth urbanstickers you@gmail.com --manual
+services:
+  app:
+    build: .
+    image: gmail-mcp-multi:latest
+    restart: unless-stopped
+    command: ["serve-http", "--mode", "${GMAIL_MCP_MODE:-drafts}"]
+    environment:
+      GMAIL_MCP_PUBLIC_URL: "https://${MCP_DOMAIN:?set MCP_DOMAIN in .env}"
+      GMAIL_MCP_HTTP_PASSWORD: "${GMAIL_MCP_HTTP_PASSWORD:?set GMAIL_MCP_HTTP_PASSWORD in .env}"
+      GMAIL_MCP_MASTER_KEY: "${GMAIL_MCP_MASTER_KEY:?set GMAIL_MCP_MASTER_KEY in .env (openssl rand -base64 32)}"
+      GMAIL_MCP_OAUTH_KEYS: /run/secrets/oauth-keys.json
+      # Caddy reaches the app over the private Docker network.
+      GMAIL_MCP_TRUST_PROXY: uniquelocal
+    volumes:
+      - gmail-mcp-data:/data
+      - ./secrets/oauth-keys.json:/run/secrets/oauth-keys.json:ro
+    expose:
+      - "8787"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      MCP_DOMAIN: "${MCP_DOMAIN}"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  gmail-mcp-data:
+  caddy-data:
+  caddy-config:
