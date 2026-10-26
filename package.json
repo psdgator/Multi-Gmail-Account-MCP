@@ -1,18 +1,22 @@
 {
-  "name": "gmail-mcp-multi",
-  "version": "0.2.0",
-  "description": "Gmail MCP server with real multi-account support: pick an account by alias, or search and summarize all your inboxes at once",
+  "name": "multi-gmail-account-mcp",
+  "version": "0.3.0",
+  "mcpName": "io.github.psdgator/multi-gmail-account-mcp",
+  "description": "MCP server for many Gmail (and IMAP) accounts at once: search all inboxes together, needs-reply finder, daily digest, attachments, Calendar, safe drafts-only mode, hosted mode for claude.ai.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
+    "multi-gmail-account-mcp": "dist/index.js",
     "gmail-mcp-multi": "dist/index.js"
   },
   "files": [
-    "dist",
-    "scripts",
+    "dist/**/*.js",
+    "scripts/smoke.mjs",
     "README.md",
     "PRIVACY.md",
-    "LICENSE"
+    "CHANGELOG.md",
+    "LICENSE",
+    "server.json"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -22,15 +26,21 @@
     "accounts": "node dist/index.js accounts",
     "test": "npm run build && vitest run",
     "prepare": "npm run build",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "prepublishOnly": "npm test",
+    "docs": "npm run build && node scripts/gen-tools-doc.mjs"
   },
   "keywords": [
     "mcp",
+    "mcp-server",
+    "model-context-protocol",
     "gmail",
+    "imap",
     "email",
     "multi-account",
-    "model-context-protocol",
-    "claude"
+    "google-calendar",
+    "claude",
+    "claude-desktop"
   ],
   "author": "Elle Morrill",
   "contributors": [
@@ -64,5 +74,9 @@
   },
   "optionalDependencies": {
     "@napi-rs/keyring": "^2.1.2"
+  },
+  "homepage": "https://github.com/psdgator/Multi-Gmail-Account-MCP#readme",
+  "bugs": {
+    "url": "https://github.com/psdgator/Multi-Gmail-Account-MCP/issues"
   }
 }
