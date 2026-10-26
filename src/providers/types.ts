@@ -180,7 +180,9 @@ export function unsupported(account: AccountConfig, feature: string): Error {
 
 /** Heuristic: automated / bulk mail that never needs a personal reply. */
 export function looksAutomated(from: string, headers: Record<string, string | undefined>): boolean {
-  if (/(no-?reply|do-?not-?reply|mailer-daemon|postmaster|notifications?@|notify@|bounces?[@+.-]|newsletter|news@|info@mailchimp|@.*\.mcsv\.net)/i.test(from)) return true;
+  const addr = (from.match(/<([^>]+)>/)?.[1] ?? from).toLowerCase();
+  if (/(no[-_.]?reply|do[-_.]?not[-_.]?reply|mailer-daemon|postmaster|bounces?[@+.-]|\.mcsv\.net|mailchimp|sendgrid|amazonses)/.test(addr)) return true;
+  if (/^(notifications?|notify|alerts?|newsletters?|news|e-?bill(ing)?|billing|invoices?|receipts?|statements?|automated|auto|system|daemon|updates?|marketing|promo(tions)?|digest)[@+.-]/.test(addr)) return true;
   if (headers["list-unsubscribe"] || headers["list-id"]) return true;
   const auto = headers["auto-submitted"];
   if (auto && auto.toLowerCase() !== "no") return true;

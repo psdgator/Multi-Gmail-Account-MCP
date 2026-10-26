@@ -116,6 +116,10 @@ describe("automated-mail heuristic", () => {
     expect(looksAutomated("Shop <news@shop.gr>", { "list-unsubscribe": "<mailto:u@shop.gr>" })).toBe(true);
     expect(looksAutomated("x@y.com", { "auto-submitted": "auto-replied" })).toBe(true);
     expect(looksAutomated("Μαρία <maria@acme.example>", { "auto-submitted": "no" })).toBe(false);
+    expect(looksAutomated('"Acs eΤιμολόγια" <e-bill@courier.example>', {})).toBe(true);
+    expect(looksAutomated("Shop <billing@shop.example>", {})).toBe(true);
+    expect(looksAutomated("Bob <bob.billington@client.example>", {})).toBe(false);
+    expect(looksAutomated("Newsroom Editor <editor@paper.example>", {})).toBe(false);
   });
 });
 
