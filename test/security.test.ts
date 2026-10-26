@@ -10,7 +10,7 @@ describe("file path policy", () => {
   let home: string;
   const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, GMAIL_MCP_HOME: process.env.GMAIL_MCP_HOME, GMAIL_MCP_ALLOWED_DIRS: process.env.GMAIL_MCP_ALLOWED_DIRS };
   beforeAll(() => {
-    home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gmm-home-")));
+    home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gmm-home-")));
     process.env.HOME = home;
     process.env.USERPROFILE = home;
     process.env.GMAIL_MCP_HOME = path.join(home, ".gmail-mcp");
@@ -68,7 +68,7 @@ describe("file path policy", () => {
   });
 
   it("GMAIL_MCP_ALLOWED_DIRS adds folders outside home", () => {
-    const extra = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gmm-extra-")));
+    const extra = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gmm-extra-")));
     fs.writeFileSync(path.join(extra, "a.txt"), "x");
     expect(() => checkPath(path.join(extra, "a.txt"), "read")).toThrow(/outside/);
     process.env.GMAIL_MCP_ALLOWED_DIRS = extra;

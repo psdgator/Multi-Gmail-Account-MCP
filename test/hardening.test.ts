@@ -21,7 +21,7 @@ describe("path policy hardening", () => {
   let home: string;
   const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, GMAIL_MCP_HOME: process.env.GMAIL_MCP_HOME, GMAIL_MCP_ALLOWED_DIRS: process.env.GMAIL_MCP_ALLOWED_DIRS };
   beforeAll(() => {
-    home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gmm-hard-")));
+    home = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gmm-hard-")));
     process.env.HOME = home;
     process.env.USERPROFILE = home;
     process.env.GMAIL_MCP_HOME = path.join(home, ".gmail-mcp");
