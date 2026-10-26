@@ -49,7 +49,10 @@ First release as **multi-gmail-account-mcp** (fork of dmorrill/gmail-mcp-multi).
 - **Release workflow:** tests and publishing in separate jobs, OIDC token only in the publish job, install scripts disabled there, actions pinned by commit and the registry publisher by checksum.
 - **Hosted mode:**
   - sign-out works across processes; changing the password signs everyone out
-  - lockout is per IP / IPv6 /64, with no global lock-out of the owner
+  - one password guess per sign-in request; password checks run one at a time server-wide (about 2.5 guesses per second in total), with a bounded queue
+  - rate limits on the sign-in endpoints; lockout is per IP / IPv6 /64, escalating to the /48, with no global lock-out of the owner
+  - limiter and pending sign-in maps are bounded
+  - the auth file is written atomically, refuses to overwrite changes made by another process, and fails closed if it can't be re-read (`http-logout` resets it)
   - unused OAuth clients are evicted
   - refresh tokens have a grace window
   - one shared mail connection pool
